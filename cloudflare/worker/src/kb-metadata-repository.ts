@@ -301,6 +301,7 @@ export interface MetadataRepository {
   setFileStatus(project: string, id: string, status: string, error?: string | null): Promise<void>;
   listKbChunkVectorIds(project: string, fileIds: string[]): Promise<string[]>;
   listKbChunks(project: string, domain?: string, fileId?: string, limit?: number): Promise<KbChunkRecord[]>;
+  hasFileWithContentHash(project: string, contentHash: string): Promise<boolean>;
   hasSharedFileStorage(files: FileRecord[]): Promise<boolean>;
   deleteFiles(project: string, fileIds: string[]): Promise<FileRecord[]>;
   upsertParseArtifact(input: {
@@ -984,6 +985,14 @@ export class D1MetadataRepository implements MetadataRepository {
       .bind(...values)
       .all<StoredKbChunk>();
     return (result.results ?? []).map(rowToKbChunk);
+  }
+
+  async hasFileWithContentHash(project: string, contentHash: string): Promise<boolean> {
+    const row = await this.db
+      .prepare('SELECT 1 AS found FROM kb_files WHERE project = ? AND content_hash = ? LIMIT 1')
+      .bind(project, contentHash)
+      .first<{ found: number }>();
+    return Boolean(row);
   }
 
   async hasSharedFileStorage(files: FileRecord[]): Promise<boolean> {

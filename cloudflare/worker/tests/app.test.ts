@@ -465,6 +465,10 @@ class MemoryMetadataRepository implements MetadataRepository {
       }));
   }
 
+  async hasFileWithContentHash(project: string, contentHash: string): Promise<boolean> {
+    return [...this.files.values()].some((file) => file.project === project && file.content_hash === contentHash);
+  }
+
   async hasSharedFileStorage(files: FileRecord[]): Promise<boolean> {
     const deleting = new Set(files.map((file) => file.id));
     return [...this.files.values()].some((other) => !deleting.has(other.id) && files.some((file) =>

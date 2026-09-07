@@ -517,7 +517,7 @@ export function registerIngestRoutes(app: App, rt: AppRuntime): void {
   app.get('/v1/kb/parse-artifacts/:hash', async (c) => {
     const repo = makeMetadataRepository(c.env);
     const hash = c.req.param('hash');
-    const owned = (await repo.listFiles(c.get('tenant'))).some((file) => file.content_hash === hash);
+    const owned = await repo.hasFileWithContentHash(c.get('tenant'), hash);
     if (!owned) return c.json({ error: 'parse artifact not found' }, 404);
     const artifact = await repo.getParseArtifact(hash);
     if (!artifact) return c.json({ error: 'parse artifact not found' }, 404);
