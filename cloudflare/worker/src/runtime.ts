@@ -365,8 +365,14 @@ export function createRuntime(options: AppOptions = {}) {
   ): Promise<{
     deletedFiles: FileRecord[];
     deletedVectors: number;
+    blocked?: 'shared_file_storage';
   }> {
     const metadataRepo = makeMetadataRepository(env);
+    // Fail before any vectors or metadata are removed. Legacy raw/parse objects
+    // are content-addressed across scopes; deleting them can break other files.
+    if (await metadataRepo.hasSharedFileStorage(files)) {
+      return { deletedFiles: [], deletedVectors: 0, blocked: 'shared_file_storage' };
+    }
     const ragRepo = makeRepository(env);
     const vectorIds = await metadataRepo.listKbChunkVectorIds(
       tenant,

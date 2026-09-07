@@ -32,22 +32,30 @@ This remains private shared infrastructure. The public repository and explanator
 landing page can be reviewed; they do not provide an anonymous document-search
 product.
 
-Fresh local verification ran the existing Worker API suite: **93 tests passed**,
-including synthetic ingestion, cited answers and query traces, and rejection of
-cross-tenant index access. These tests use in-memory repositories and simulated
-R2, Vectorize and AI bindings. They establish local route behavior, not deployed
-provider health or live retrieval quality.
+Fresh local verification includes a multipart synthetic document upload, inline
+ingestion, an exact file/page/excerpt citation, reopening through a new handler,
+and sole-owner deletion followed by404 lookups and empty search/vector results.
+Unauthenticated and cross-tenant reads are rejected. These are actual Worker
+routes with local in-memory repositories and simulated R2, Vectorize and AI;
+they do not establish deployed provider health, D1 durability or live retrieval
+quality. [Reproduction and limits](docs/development/document-workflow-qualification-2026-09-07.md).
 
-The remaining shareability gate is an authenticated, deployed consumer journey:
-ingest an approved synthetic document into an isolated scope, retrieve it, inspect
-the cited file/page/excerpt against the input, verify scope isolation, and remove
-the test data. The operator dashboard also needs a fresh signed-in review. No
-production upload, deployment or credential access was performed for this audit.
-Preserve the healthy service until a concrete consumer failure justifies changes.
+The audit reproduced shared-object data loss: deleting one tenant's identical
+file removed another tenant's raw object. Deletion now returns409 before mutation
+when existing records share storage outside the requested deletion set.
+Parse-artifact lookup requires a tenant-owned file. This mitigation does not
+provide independent deletion of shared data or atomic protection against
+concurrent ingestion; tenant/file-owned artifact isolation remains unfinished.
 
-Task reconciliation found **zero open GitHub issues and zero open PRs**; none were
-closed. The qualification work above remains explicitly unfinished. Historical
-status and scorecard claims are dated evidence, not a substitute for this check.
+The remaining gate is an authenticated, deployed consumer journey with approved
+synthetic content: upload, retrieve, inspect citations, reopen, verify isolation
+and clean up. The signed-in operator dashboard also remains unverified.
+No production upload, migration, deployment or credential access was performed.
+
+Task reconciliation: **one open issue, zero open PRs, zero closures**.
+[Issue48](https://github.com/sass-maker/knowledge-base/issues/48) retains storage
+isolation, concurrent deletion safety and live qualification. Preserve the
+healthy service outside this concrete reproduced failure.
 
 ## What's interesting about this one
 

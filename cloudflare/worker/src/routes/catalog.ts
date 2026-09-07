@@ -551,6 +551,7 @@ export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
     const file = await repo.getFile(tenant, c.req.param('file_id'));
     if (!file) return c.json({ error: 'file not found' }, 404);
     const deleted = await deleteKbFiles(c.env, tenant, [file]);
+    if (deleted.blocked) return c.json({ error: deleted.blocked, message: 'Deletion is blocked because storage is shared. No file was removed.' }, 409);
     return c.json({
       project: tenant,
       affected_files: deleted.deletedFiles.length,
@@ -907,6 +908,7 @@ export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
       return c.json({ project: tenant, source_set_id: id, action, affected_files: files.length });
     }
     const deleted = await deleteKbFiles(c.env, tenant, files);
+    if (deleted.blocked) return c.json({ error: deleted.blocked, message: 'Deletion is blocked because storage is shared. No file was removed.' }, 409);
     return c.json({
       project: tenant,
       source_set_id: id,

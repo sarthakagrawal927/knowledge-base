@@ -88,3 +88,5 @@ retains `(file, page, excerpt)` provenance for agents.
   update the current doc and let the archive stay a snapshot.
 - Mark unresolved questions explicitly (see `STATUS.md` → "Unresolved
   questions").
+
+- [Local document workflow qualification](development/document-workflow-qualification-2026-09-07.md) — synthetic handler proof and remaining shared-storage gates.

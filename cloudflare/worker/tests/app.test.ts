@@ -465,6 +465,12 @@ class MemoryMetadataRepository implements MetadataRepository {
       }));
   }
 
+  async hasSharedFileStorage(files: FileRecord[]): Promise<boolean> {
+    const deleting = new Set(files.map((file) => file.id));
+    return [...this.files.values()].some((other) => !deleting.has(other.id) && files.some((file) =>
+      other.object_key === file.object_key || other.content_hash === file.content_hash));
+  }
+
   async deleteFiles(project: string, fileIds: string[]): Promise<FileRecord[]> {
     const selected = new Set(fileIds);
     const deleted = [...this.files.values()].filter((file) => file.project === project && selected.has(file.id));
@@ -7108,6 +7114,76 @@ describe('knowledgebase RAG Worker app', () => {
 
     expect(repo.getIndexByExternalIdCalls).toBe(0);
     expect(repo.listChunksForIndexCalls).toBe(0);
+  });
+
+  it('qualifies synthetic authenticated import, cited retrieval, reopen and sole-owner deletion', async () => {
+    const repo = new MemoryRepository();
+    const metadata = new MemoryMetadataRepository();
+    const rawDocs = new FakeR2Bucket();
+    const vectorize = new FakeVectorize();
+    const options = { makeRepository: () => repo, makeMetadataRepository: () => metadata, embed: async (_env: Env, texts: string[]) => texts.map(vectorFor) };
+    const app = createApp(options);
+    const env = makeEnv(vectorize, undefined as unknown as D1Database, undefined, rawDocs as unknown as R2Bucket);
+    const auth = { Authorization: 'Bearer key-a', 'Content-Type': 'application/json' };
+    const text = 'Synthetic heliotrope manual: the recovery code is violet-lantern.';
+    const form = new FormData();
+    form.set('domain', 'synthetic-unique');
+    form.set('file', new File([text], 'synthetic-manual.txt', { type: 'text/plain' }));
+    const imported = await app.request('/v1/kb/files/upload', { method: 'POST', headers: { Authorization: 'Bearer key-a' }, body: form }, env);
+    expect(imported.status).toBe(201);
+    const { id: fileId } = await imported.json() as FileRecord;
+    const run = await app.request('/v1/kb/ingest/run', { method: 'POST', headers: auth, body: JSON.stringify({ domain: 'synthetic-unique', file_ids: [fileId], async: false }) }, env);
+    expect(run.status).toBe(200);
+    const file = (await metadata.getFile('tenant-a', fileId))!;
+    const artifactPath = `/v1/kb/parse-artifacts/${file.content_hash}`;
+    expect((await app.request(`/v1/kb/files/${fileId}`, {}, env)).status).toBe(401);
+    expect((await app.request(`/v1/kb/files/${fileId}`, { headers: { Authorization: 'Bearer key-b' } }, env)).status).toBe(404);
+    expect((await app.request(artifactPath, { headers: { Authorization: 'Bearer key-b' } }, env)).status).toBe(404);
+    expect((await app.request(artifactPath, { headers: auth }, env)).status).toBe(200);
+    const query = { domain: 'synthetic-unique', question: 'What is the heliotrope recovery code?', mode: 'lexical', top_k: 1 };
+    const answer = await app.request('/v1/kb/query', { method: 'POST', headers: auth, body: JSON.stringify(query) }, env);
+    expect(answer.status).toBe(200);
+    const body = await answer.json() as { citations: CitationRecord[] };
+    expect(body.citations[0]).toMatchObject({ file_id: fileId, page_start: 1, page_end: 1 });
+    expect(text).toContain(body.citations[0]!.excerpt);
+    expect(body.citations[0]!.excerpt).toContain('violet-lantern');
+    const reopened = createApp(options);
+    const opened = await reopened.request(`/v1/kb/files/${fileId}`, { headers: auth }, env);
+    expect(opened.status).toBe(200);
+    expect(await rawDocs.get(file.object_key)).not.toBeNull();
+    const removed = await reopened.request(`/v1/kb/files/${fileId}`, { method: 'DELETE', headers: auth }, env);
+    expect(removed.status).toBe(200);
+    expect(await rawDocs.get(file.object_key)).toBeNull();
+    expect((await reopened.request(`/v1/kb/files/${fileId}`, { headers: auth }, env)).status).toBe(404);
+    expect((await reopened.request(artifactPath, { headers: auth }, env)).status).toBe(404);
+    const searched = await reopened.request('/v1/kb/search', { method: 'POST', headers: auth, body: JSON.stringify({ domain: 'synthetic-unique', query: 'heliotrope recovery', mode: 'lexical' }) }, env);
+    expect((await searched.json() as { data: SearchResult[] }).data).toEqual([]);
+    expect(vectorize.vectors.size).toBe(0);
+  });
+
+  it('preserves another tenant document when identical storage is deleted', async () => {
+    const repo = new MemoryRepository();
+    const metadata = new MemoryMetadataRepository();
+    const rawDocs = new FakeR2Bucket();
+    const app = createApp({ makeRepository: () => repo, makeMetadataRepository: () => metadata, embed: async (_env, texts) => texts.map(vectorFor) });
+    const env = makeEnv(new FakeVectorize(), undefined as unknown as D1Database, undefined, rawDocs as unknown as R2Bucket);
+    const auth = (key: string) => ({ Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' });
+    const text = 'Synthetic heliotrope manual: the recovery code is violet-lantern.';
+    const ingest = async (key: string) => {
+      const response = await app.request('/v1/kb/ingest/text', { method: 'POST', headers: auth(key), body: JSON.stringify({ domain: 'synthetic-manual', title: 'manual', text, async: false }) }, env);
+      expect(response.status).toBe(201);
+      return await response.json() as { file_id: string };
+    };
+    const first = await ingest('key-a');
+    const second = await ingest('key-b');
+    const other = await metadata.getFile('tenant-b', second.file_id);
+    expect(other).not.toBeNull();
+    const deleted = await app.request(`/v1/kb/files/${first.file_id}`, { method: 'DELETE', headers: auth('key-a') }, env);
+    expect(deleted.status).toBe(409);
+    expect(await deleted.json()).toMatchObject({ error: 'shared_file_storage' });
+    expect(rawDocs.deletes).toEqual([]);
+    expect(await metadata.getFile('tenant-a', first.file_id)).not.toBeNull();
+    expect(await rawDocs.get(other!.object_key)).not.toBeNull();
   });
 
   it('removes deleted file chunks from lexical knowledgebase search', async () => {
