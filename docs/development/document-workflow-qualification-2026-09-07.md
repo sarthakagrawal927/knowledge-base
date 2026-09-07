@@ -77,3 +77,24 @@ access, new dependency or model/provider call was performed here.
 Validation: `pnpm quality` passed, including 364 Worker tests in 35 files, six
 dashboard tests, app typecheck/lint/build, landing checks/build, docs validation
 and all configured code-health gates. Existing debt baselines remain unchanged.
+
+## Inactive ownership foundation
+
+Migration source `0008_file_artifact_ownership.sql` and `src/file-ownership.ts`
+add a separately tested ownership ledger. Product routes do not call it yet;
+all existing intake modes remain unchanged. This is a checkpoint toward
+[issue 48](https://github.com/sass-maker/knowledge-base/issues/48), not activation
+of independent shared-file deletion.
+
+Eight tests in `tests/file-ownership.test.ts` apply the actual migrations to
+synthetic SQLite with foreign keys enabled. They exercise legacy compatibility,
+immutable duplicate registration, atomic writer claims, token collision rollback,
+tenant isolation, persistent tombstones, pending vector cleanup and a delayed
+object write spanning deletion. Two repository instances share the database.
+These are repository/state-machine tests, not concurrent Hono handler proof.
+No unsettled operation expires or is stolen; abandoned operations remain pending.
+
+The next integration must cover every supported intake/reprocess mode, scoped
+parse publication, complete document/structured evidence cleanup, durable query
+and cache visibility, provider convergence and legacy copy verification before
+routes can activate the protocol. No production migration or backfill ran.
