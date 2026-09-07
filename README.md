@@ -26,6 +26,29 @@ The wedge is intentionally narrower than "generic RAG":
 - Schema inference can start from representative uploaded files before ingestion.
 - Every useful response points back to file, page, and excerpt.
 
+## Qualification and remaining work (2026-09-07)
+
+This remains private shared infrastructure. The public repository and explanatory
+landing page can be reviewed; they do not provide an anonymous document-search
+product.
+
+Fresh local verification ran the existing Worker API suite: **93 tests passed**,
+including synthetic ingestion, cited answers and query traces, and rejection of
+cross-tenant index access. These tests use in-memory repositories and simulated
+R2, Vectorize and AI bindings. They establish local route behavior, not deployed
+provider health or live retrieval quality.
+
+The remaining shareability gate is an authenticated, deployed consumer journey:
+ingest an approved synthetic document into an isolated scope, retrieve it, inspect
+the cited file/page/excerpt against the input, verify scope isolation, and remove
+the test data. The operator dashboard also needs a fresh signed-in review. No
+production upload, deployment or credential access was performed for this audit.
+Preserve the healthy service until a concrete consumer failure justifies changes.
+
+Task reconciliation found **zero open GitHub issues and zero open PRs**; none were
+closed. The qualification work above remains explicitly unfinished. Historical
+status and scorecard claims are dated evidence, not a substitute for this check.
+
 ## What's interesting about this one
 
 **Verified across 5 LLMs × 2 unrelated domains** (SEC EDGAR filings + SPDX legal licenses), with one counter-intuitive empirical result:
