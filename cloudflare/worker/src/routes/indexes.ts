@@ -42,6 +42,8 @@ type App = Hono<{ Bindings: Env; Variables: Variables }>;
 export function registerIndexRoutes(app: App, rt: AppRuntime): void {
   const {
     makeRepository,
+    genericOwnershipConflict,
+    ownedIndexHasFiles,
     embed,
     queryCache,
     indexCache,
@@ -63,6 +65,8 @@ export function registerIndexRoutes(app: App, rt: AppRuntime): void {
     const repo = makeRepository(c.env);
     const index = await repo.getIndex(tenant, indexId);
     if (!index) return c.json({ error: 'Not found' }, 404);
+    if (await ownedIndexHasFiles(c.env, tenant, index.external_id))
+      return c.json({ error: 'Delete owned files through the KB file or source-set deletion route before removing this index.' }, 409);
     const chunkIds = await repo.getChunkIdsForIndex(tenant, indexId);
     await deleteVectorsForIndex(c.env, index, chunkIds);
     await repo.deleteIndex(tenant, indexId);
@@ -101,6 +105,8 @@ export function registerIndexRoutes(app: App, rt: AppRuntime): void {
 
     const out: Array<{ document_id: string; chunks_created: number }> = [];
     for (const input of documents) {
+      if (await genericOwnershipConflict(c.env, tenant, jsonRecord(input.metadata)))
+        return c.json({ error: 'Owned file metadata must be written through KB ingestion.' }, 409);
       const content = input.content?.trim();
       if (!content) return c.json({ error: 'document content is required' }, 400);
       if (content.length > MAX_DOC_SIZE) return c.json({ error: 'document content too large' }, 413);
@@ -170,6 +176,8 @@ export function registerIndexRoutes(app: App, rt: AppRuntime): void {
     const chunkRows: CreateChunkInput[] = [];
     const vectorRows: VectorizeVector[] = [];
     for (const input of chunks) {
+      if (await genericOwnershipConflict(c.env, tenant, jsonRecord(input.metadata), [input.id ?? '', input.document_id ?? '']))
+        return c.json({ error: 'Owned file resources must be written through KB ingestion.' }, 409);
       if (!input.id?.trim()) return c.json({ error: 'chunk id is required' }, 400);
       if (!input.document_id?.trim()) return c.json({ error: 'document_id is required' }, 400);
       if (!input.content?.trim()) return c.json({ error: 'chunk content is required' }, 400);
@@ -231,6 +239,8 @@ export function registerIndexRoutes(app: App, rt: AppRuntime): void {
     const tenant = c.get('tenant');
     const docId = c.req.param('id');
     const repo = makeRepository(c.env);
+    if (await genericOwnershipConflict(c.env, tenant, {}, [docId]))
+      return c.json({ error: 'Delete this owned document through its KB file deletion route.' }, 409);
     const doc = await repo.getDocument(tenant, docId);
     if (!doc) return c.json({ error: 'Not found' }, 404);
     const index = await getIndexRecord(c.env, repo, tenant, doc.index_id);

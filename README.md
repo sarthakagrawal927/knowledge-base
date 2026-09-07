@@ -32,30 +32,33 @@ This remains private shared infrastructure. The public repository and explanator
 landing page can be reviewed; they do not provide an anonymous document-search
 product.
 
-Fresh local verification includes a multipart synthetic document upload, inline
-ingestion, an exact file/page/excerpt citation, reopening through a new handler,
-and sole-owner deletion followed by404 lookups and empty search/vector results.
-Unauthenticated and cross-tenant reads are rejected. These are actual Worker
-routes with local in-memory repositories and simulated R2, Vectorize and AI;
-they do not establish deployed provider health, D1 durability or live retrieval
-quality. [Reproduction and limits](docs/development/document-workflow-qualification-2026-09-07.md).
+The default service still uses the conservative shared-object deletion guard:
+409 prevents known shared raw/parse objects from being removed. This guard is
+not atomic with concurrent legacy ingestion.
 
-The audit reproduced shared-object data loss: deleting one tenant's identical
-file removed another tenant's raw object. Deletion now returns409 before mutation
-when existing records share storage outside the requested deletion set.
-Parse-artifact lookup requires a tenant-owned file. This mitigation does not
-provide independent deletion of shared data or atomic protection against
-concurrent ingestion; tenant/file-owned artifact isolation remains unfinished.
+An internally enabled ownership protocol now has actual Hono-handler proof
+against migrated synthetic SQLite: immutable per-file uploads, scoped parse
+artifacts, cited text/record retrieval, surviving entity/graph evidence, queue
+and reprocess, concurrent deletion, and retryable physical cleanup. Separate
+handler caches stop returning deleted evidence. R2, Vectorize and embeddings
+remain deterministic fixtures; no live provider quality is established.
+[Reproduction and limits](docs/development/document-workflow-qualification-2026-09-07.md).
 
-The remaining gate is an authenticated, deployed consumer journey with approved
-synthetic content: upload, retrieve, inspect citations, reopen, verify isolation
-and clean up. The signed-in operator dashboard also remains unverified.
-No production upload, migration, deployment or credential access was performed.
+**The new protocol is not activated.** It requires additive migrations 0008/0009,
+reviewed rollout, verified legacy copy/backfill, recovery for unsettled operations,
+and authorized deployed consumer/operator qualification. Existing legacy files
+are preserved; no production upload, migration, deployment or credential access
+was performed.
+
+Deletion distinguishes immediate removal from search from physical cleanup of
+indexed file artifacts. A pending write or unconfirmed vector mutation returns
+202. Saved conversations and query traces remain; their old source links cannot
+retrieve deleted files or republish them into new results.
 
 Task reconciliation: **one open issue, zero open PRs, zero closures**.
-[Issue48](https://github.com/sass-maker/knowledge-base/issues/48) retains storage
-isolation, concurrent deletion safety and live qualification. Preserve the
-healthy service outside this concrete reproduced failure.
+[Issue 48](https://github.com/sass-maker/knowledge-base/issues/48) retains activation,
+legacy migration/recovery and live qualification. Local proof is not deployment
+or completion of the legacy migration.
 
 ## What's interesting about this one
 

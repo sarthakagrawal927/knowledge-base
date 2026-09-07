@@ -1,6 +1,9 @@
 import { parseCacheOptions, TtlCache } from './cache';
 import { chunkText } from './chunk';
 import { D1Repository } from './d1-repository';
+import { storeFileBytes, registerOwnedObject, persistParseArtifact, deleteOwnedFile, UnsettledFileWrite } from './owned-storage';
+import { D1FileOwnership, type FileOperation } from './file-ownership';
+import { HTTPException } from 'hono/http-exception';
 import { parseUploadBytesWithCloudflare } from './document-parser';
 import { D1MetadataRepository } from './kb-metadata-repository';
 import {
@@ -94,8 +97,8 @@ import type { CreateChunkInput, Repository } from './repository';
 import type { ChunkRecord, Env, IndexRecord, JsonRecord, SearchResult, VectorizeVector } from './types';
 
 export function createRuntime(options: AppOptions = {}) {
-  const makeRepository = options.makeRepository ?? ((env: Env) => new D1Repository(env.DB));
-  const makeMetadataRepository = options.makeMetadataRepository ?? ((env: Env) => new D1MetadataRepository(env.DB));
+  const makeRepository = options.makeRepository ?? ((env: Env) => new D1Repository(env.DB, options.ownedFileProtocol === true));
+  const makeMetadataRepository = options.makeMetadataRepository ?? ((env: Env) => new D1MetadataRepository(env.DB, options.ownedFileProtocol === true));
   const embed = options.embed ?? defaultEmbed;
   const queryCache = options.queryCache ?? new TtlCache<QueryPayload>(parseCacheOptions({}));
   const answerCache = options.answerCache ?? new TtlCache<KbAnswerPayload>(parseCacheOptions({}));
@@ -104,6 +107,87 @@ export function createRuntime(options: AppOptions = {}) {
   const indexRecordCache = options.indexRecordCache ?? new TtlCache<IndexRecord>(parseCacheOptions({}));
   const kbDomainIndexCache = options.kbDomainIndexCache ?? new TtlCache<IndexRecord>(parseCacheOptions({}));
   const lexicalChunkCache = options.lexicalChunkCache ?? new TtlCache<ChunkRecord[]>(parseCacheOptions({}));
+
+  const storeRawFile = (env: Env, input: Parameters<typeof storeFileBytes>[3], bytes: Parameters<typeof storeFileBytes>[4], putOptions: R2PutOptions) =>
+    storeFileBytes(env, makeMetadataRepository(env), options.ownedFileProtocol === true, input, bytes, putOptions);
+
+  const registerStoredFile = (env: Env, input: Parameters<typeof registerOwnedObject>[3]) =>
+    registerOwnedObject(env, makeMetadataRepository(env), options.ownedFileProtocol === true, input);
+  const persistParse = (
+    env: Env,
+    operation: FileOperation | undefined,
+    input: Parameters<typeof persistParseArtifact>[3],
+    content: string,
+    putOptions: R2PutOptions,
+  ) => persistParseArtifact(env, makeMetadataRepository(env), operation, input, content, putOptions);
+  async function beginOwnedOperation(env: Env, tenant: string, fileId: string): Promise<FileOperation | undefined> {
+    if (!options.ownedFileProtocol) return undefined;
+    const operation = await new D1FileOwnership(env.DB).claim(tenant, fileId, crypto.randomUUID(), 'ingest');
+    if (!operation) throw new HTTPException(409, { message: 'File operation is pending or requires verified legacy migration.' });
+    return operation;
+  }
+  async function abortOwnedOperation(env: Env, operation: FileOperation | undefined): Promise<void> {
+    if (!operation) return;
+    await env.DB.prepare(`UPDATE kb_files SET status='failed', last_error='Owned ingestion did not publish', updated_at=datetime('now')
+      WHERE project=? AND id=? AND EXISTS (SELECT 1 FROM kb_file_lifecycle l WHERE l.project=? AND l.file_id=? AND l.state='active' AND l.generation=?)`)
+      .bind(operation.project, operation.file_id, operation.project, operation.file_id, operation.generation)
+      .run();
+    await new D1FileOwnership(env.DB).settle(operation, false);
+  }
+
+  async function completeOwnedOperation(env: Env, operation: FileOperation | undefined): Promise<boolean> {
+    if (!operation) return true;
+    return await new D1FileOwnership(env.DB).publish(operation, [
+      env.DB.prepare("UPDATE kb_files SET status = 'ready', last_error = NULL, updated_at = datetime('now') WHERE project = ? AND id = ?").bind(
+        operation.project,
+        operation.file_id,
+      ),
+    ]);
+  }
+  const ownedDeletion = (env: Env, tenant: string, fileId: string) =>
+    options.ownedFileProtocol ? deleteOwnedFile(env, tenant, fileId, configuredVectorizeProfiles(env)) : Promise.resolve(null);
+
+  const listDeletionFiles = (env: Env, tenant: string, domain: string) =>
+    options.ownedFileProtocol ? new D1MetadataRepository(env.DB).listFiles(tenant, domain) : makeMetadataRepository(env).listFiles(tenant, domain);
+  async function ownedParseLookup(env: Env, tenant: string, hash: string, fileId?: string) {
+    if (!options.ownedFileProtocol) return null;
+    const known = await env.DB.prepare('SELECT 1 FROM kb_file_lifecycle WHERE project = ? AND content_hash = ? LIMIT 1').bind(tenant, hash).first();
+    if (!known) return null;
+    const rows = await env.DB.prepare(`SELECT p.content_hash,p.parser,p.parser_version,p.page_count,a.resource_id AS object_key,
+      l.file_id, pub.created_at FROM kb_file_parse_artifacts p JOIN kb_file_lifecycle l ON l.project=p.project AND l.file_id=p.file_id
+      JOIN kb_file_artifacts a ON a.artifact_id=p.artifact_id JOIN kb_file_publications pub ON pub.operation_id=a.operation_id
+      WHERE l.project=? AND p.content_hash=? AND l.state='active' AND l.published_generation=p.generation
+      AND (? IS NULL OR l.file_id=?) LIMIT 2`)
+      .bind(tenant, hash, fileId ?? null, fileId ?? null)
+      .all();
+    return { ambiguous: rows.results.length > 1, artifact: rows.results.length === 1 ? rows.results[0] : null };
+  }
+
+  async function genericOwnershipConflict(env: Env, tenant: string, metadata: JsonRecord, resourceIds: string[] = []): Promise<boolean> {
+    if (!options.ownedFileProtocol) return false;
+    const fileId = typeof metadata.file_id === 'string' ? metadata.file_id : '';
+    const row = await env.DB.prepare(`SELECT 1 AS found FROM kb_file_lifecycle WHERE project=? AND file_id=?
+      UNION ALL SELECT 1 FROM kb_file_artifacts WHERE resource_id IN (SELECT value FROM json_each(?)) LIMIT 1`)
+      .bind(tenant, fileId, JSON.stringify(resourceIds))
+      .first();
+    return Boolean(row);
+  }
+  async function ownedIndexHasFiles(env: Env, tenant: string, externalId: string | null): Promise<boolean> {
+    if (!options.ownedFileProtocol || !externalId?.startsWith('kb:')) return false;
+    return Boolean(
+      await env.DB.prepare("SELECT 1 FROM kb_file_lifecycle WHERE project=? AND domain=? AND state!='deleted' LIMIT 1")
+        .bind(tenant, externalId.slice(3))
+        .first(),
+    );
+  }
+
+  async function durableRevision(env: Env, tenant: string): Promise<number> {
+    if (!options.ownedFileProtocol) return 0;
+    const row = await env.DB.prepare('SELECT COALESCE(SUM(revision), 0) AS revision FROM kb_scope_revisions WHERE project = ?')
+      .bind(tenant)
+      .first<{ revision: number }>();
+    return row?.revision ?? 0;
+  }
 
   function clearAnswerAndQueryCaches(): void {
     queryCache.clear();
@@ -364,10 +448,26 @@ export function createRuntime(options: AppOptions = {}) {
     files: FileRecord[],
   ): Promise<{
     deletedFiles: FileRecord[];
-    deletedVectors: number;
+    deletedVectors: number | null;
     blocked?: 'shared_file_storage';
+    pending?: string[];
   }> {
     const metadataRepo = makeMetadataRepository(env);
+    if (options.ownedFileProtocol) {
+      const owned: FileRecord[] = [];
+      const legacy: FileRecord[] = [];
+      const ledger = new D1FileOwnership(env.DB);
+      for (const file of files) ((await ledger.get(tenant, file.id)) ? owned : legacy).push(file);
+      // Legacy references remain protected until a verified copy/backfill.
+      if (legacy.length) return { deletedFiles: [], deletedVectors: 0, blocked: 'shared_file_storage' };
+      const pending: string[] = [];
+      const deletedFiles: FileRecord[] = [];
+      for (const file of owned) {
+        if ((await ownedDeletion(env, tenant, file.id)) === 'complete') deletedFiles.push(file);
+        else pending.push(file.id);
+      }
+      return { deletedFiles, deletedVectors: null, pending };
+    }
     // Fail before any vectors or metadata are removed. Legacy raw/parse objects
     // are content-addressed across scopes; deleting them can break other files.
     if (await metadataRepo.hasSharedFileStorage(files)) {
@@ -429,7 +529,7 @@ export function createRuntime(options: AppOptions = {}) {
   async function getCachedLexicalChunks(env: Env, repo: Repository, tenant: string, indexId: string, timing?: RagTiming): Promise<ChunkRecord[]> {
     const started = performance.now();
     lexicalChunkCache.configure(parseCacheOptions(env));
-    const key = buildCacheKey({ tenant, indexId });
+    const key = buildCacheKey({ tenant, indexId, revision: await durableRevision(env, tenant) });
     const cached = lexicalChunkCache.get(key);
     if (cached) {
       if (timing) {
@@ -457,7 +557,7 @@ export function createRuntime(options: AppOptions = {}) {
     try {
       lexicalChunkCache.configure(parseCacheOptions(env));
       const chunks = await repo.listChunksForIndex(tenant, indexId, MAX_LEXICAL_CHUNKS);
-      lexicalChunkCache.set(buildCacheKey({ tenant, indexId }), chunks);
+      lexicalChunkCache.set(buildCacheKey({ tenant, indexId, revision: await durableRevision(env, tenant) }), chunks);
     } catch {
       // Cache priming is only a latency optimization; retrieval can still load chunks on demand.
     }
@@ -487,6 +587,7 @@ export function createRuntime(options: AppOptions = {}) {
     const normalizedQuery = normalizeSemanticQuery(query);
     const queryPlan = body.mode === 'lexical' && body.query_rewrite !== true && body.query_decompose !== true ? { variants: [] } : buildQueryPlan(query, body);
     const cacheKey = buildCacheKey({
+      revision: await durableRevision(c.env, tenant),
       tenant,
       indexId,
       query: normalizedQuery,
@@ -741,6 +842,7 @@ export function createRuntime(options: AppOptions = {}) {
     chunkRows: CreateChunkInput[],
     vectors: number[][],
     profile: ConfiguredVectorizeProfile,
+    operation?: FileOperation,
   ): Promise<void> {
     const rows: VectorizeVector[] = chunkRows.map((chunk, i) => ({
       id: chunk.id,
@@ -748,7 +850,32 @@ export function createRuntime(options: AppOptions = {}) {
       namespace: vectorNamespace(tenant, indexId),
       metadata: vectorMetadata(tenant, indexId, chunk.documentId, chunk.chunkIndex, chunk.content, chunk.metadata),
     }));
-    if (rows.length > 0) await profile.binding.upsert(rows);
+    if (rows.length === 0) return;
+    const ledger = operation ? new D1FileOwnership(env.DB) : undefined;
+    const intents: Array<{ artifactId: string; rowId: string }> = [];
+    if (operation && ledger) {
+      for (const row of rows) {
+        const artifactId = crypto.randomUUID();
+        if (!(await ledger.recordIntent(operation, { artifact_id: artifactId, kind: 'vector', resource_id: row.id, provider: `vector:${profile.key}` })))
+          throw new HTTPException(409, { message: 'File deletion is pending.' });
+        intents.push({ artifactId, rowId: row.id });
+      }
+    }
+    let receipt: unknown;
+    try {
+      receipt = await profile.binding.upsert(rows);
+    } catch (error) {
+      if (operation) throw new UnsettledFileWrite('Vector upsert settlement is unknown.');
+      throw error;
+    }
+    for (const intent of intents)
+      await ledger!.recordWrite(
+        operation!.project,
+        operation!.operation_id,
+        intent.artifactId,
+        'accepted',
+        typeof jsonRecord(receipt).mutationId === 'string' ? String(jsonRecord(receipt).mutationId) : null,
+      );
   }
 
   async function ingestDocumentsToIndex(
@@ -758,6 +885,7 @@ export function createRuntime(options: AppOptions = {}) {
     indexId: string,
     documents: Array<{ external_id: string; content: string; metadata: JsonRecord }>,
     chunking?: KbIngestRunBody['chunking'],
+    operation?: FileOperation,
   ): Promise<{ document_id: string; chunks: CreateChunkInput[] }[]> {
     const out: { document_id: string; chunks: CreateChunkInput[] }[] = [];
     const index = await getIndexRecord(env, repo, tenant, indexId);
@@ -767,11 +895,26 @@ export function createRuntime(options: AppOptions = {}) {
     const smallProfile = embeddingProfile.vectorizeProfile === 'base' ? configuredVectorizeProfiles(env).find((profile) => profile.key === 'small') : undefined;
     const pendingChunks: CreateChunkInput[] = [];
     const pendingChunkContents: string[] = [];
-    for (const input of documents) {
+    for (const original of documents) {
+      const input = operation
+        ? {
+            ...original,
+            external_id: `${original.external_id}:owned:${operation.operation_id}`,
+            metadata: { ...original.metadata, file_generation: operation.generation },
+          }
+        : original;
       const content = input.content.trim();
       if (!content) continue;
       if (content.length > MAX_DOC_SIZE) throw new Error('document content too large');
       const documentId = input.external_id ? await deterministicId('doc', `${tenant}:${indexId}:${input.external_id}`) : crypto.randomUUID();
+      const ledger = operation ? new D1FileOwnership(env.DB) : undefined;
+      const artifactId = crypto.randomUUID();
+      if (
+        operation &&
+        ledger &&
+        !(await ledger.recordIntent(operation, { artifact_id: artifactId, kind: 'document', resource_id: documentId, provider: 'd1' }))
+      )
+        throw new HTTPException(409, { message: 'File deletion is pending.' });
       const existingDocument = await repo.getDocument(tenant, documentId);
       const document =
         existingDocument ??
@@ -783,6 +926,7 @@ export function createRuntime(options: AppOptions = {}) {
           content,
           metadata: input.metadata,
         }));
+      if (operation && ledger) await ledger.recordWrite(tenant, operation.operation_id, artifactId, 'confirmed');
       const chunkContents = chunkText(content, chunking);
       const chunkRows: CreateChunkInput[] = [];
       for (let i = 0; i < chunkContents.length; i += 1) {
@@ -805,9 +949,9 @@ export function createRuntime(options: AppOptions = {}) {
     const vectors = await embed(env, pendingChunkContents, embeddingOptionsForProfile(embeddingProfile));
     const smallVectors = smallProfile ? await embed(env, pendingChunkContents, { model: embeddingModel(env, 'small') }) : [];
     await repo.insertChunks(pendingChunks);
-    await upsertChunkVectors(env, tenant, indexId, pendingChunks, vectors, vectorizeProfile);
+    await upsertChunkVectors(env, tenant, indexId, pendingChunks, vectors, vectorizeProfile, operation);
     if (smallProfile && smallVectors.length > 0) {
-      await upsertChunkVectors(env, tenant, indexId, pendingChunks, smallVectors, smallProfile);
+      await upsertChunkVectors(env, tenant, indexId, pendingChunks, smallVectors, smallProfile, operation);
     }
     return out;
   }
@@ -829,10 +973,19 @@ export function createRuntime(options: AppOptions = {}) {
     const selectedIds = new Set((body.file_ids ?? []).filter(Boolean));
     const files =
       selectedIds.size > 0
-        ? (await Promise.all([...selectedIds].map((id) => metadataRepo.getFile(tenant, id)))).filter((file): file is NonNullable<typeof file> => Boolean(file))
+        ? (await Promise.all([...selectedIds].map((id) => metadataRepo.getFile(tenant, id)))).filter((file): file is NonNullable<typeof file> =>
+            Boolean(file && file.domain === domain),
+          )
         : await metadataRepo.listFiles(tenant, domain, ['pending']);
     const results = [];
     for (const file of files) {
+      let operation: FileOperation | undefined;
+      try {
+        operation = await beginOwnedOperation(env, tenant, file.id);
+      } catch {
+        results.push({ file_id: file.id, status: 'skipped', reason: 'owned_operation_pending_or_legacy' });
+        continue;
+      }
       const job = await metadataRepo.upsertIngestJob({
         project: tenant,
         domain,
@@ -842,7 +995,7 @@ export function createRuntime(options: AppOptions = {}) {
         stage: 'parse',
         workflowId: runId,
       });
-      if (isIngestJobLeaseActive(job, Date.now(), INGEST_JOB_LEASE_MS, lockedBy)) {
+      if (!operation && isIngestJobLeaseActive(job, Date.now(), INGEST_JOB_LEASE_MS, lockedBy)) {
         results.push({
           job_id: job.id,
           file_id: file.id,
@@ -888,41 +1041,44 @@ export function createRuntime(options: AppOptions = {}) {
           },
         }));
         const artifactKey = parseArtifactKey(domain, file.content_hash);
-        await env.RAW_DOCS.put(
-          artifactKey,
-          JSON.stringify({
-            parser: parsed.parser,
-            parser_version: parsed.parser_version,
+        const parseContent = JSON.stringify({
+          parser: parsed.parser,
+          parser_version: parsed.parser_version,
+          project: tenant,
+          domain,
+          file_id: file.id,
+          filename: file.filename,
+          content_hash: file.content_hash,
+          record_count: parsed.record_count,
+          document_count: docs.length,
+          text_length: parsed.text.length,
+          documents: docs,
+        });
+        const parseOptions = {
+          httpMetadata: { contentType: 'application/json' },
+          customMetadata: {
             project: tenant,
             domain,
             file_id: file.id,
-            filename: file.filename,
             content_hash: file.content_hash,
-            record_count: parsed.record_count,
-            document_count: docs.length,
-            text_length: parsed.text.length,
-            documents: docs,
-          }),
-          {
-            httpMetadata: { contentType: 'application/json' },
-            customMetadata: {
-              project: tenant,
-              domain,
-              file_id: file.id,
-              content_hash: file.content_hash,
-              parser: parsed.parser,
-            },
+            parser: parsed.parser,
           },
+        };
+        const artifact = await persistParse(
+          env,
+          operation,
+          {
+            contentHash: file.content_hash,
+            parser: parsed.parser,
+            parserVersion: parsed.parser_version,
+            objectKey: artifactKey,
+            pageCount: parsed.page_count,
+          },
+          parseContent,
+          parseOptions,
         );
-        const artifact = await metadataRepo.upsertParseArtifact({
-          contentHash: file.content_hash,
-          parser: parsed.parser,
-          parserVersion: parsed.parser_version,
-          objectKey: artifactKey,
-          pageCount: parsed.page_count,
-        });
         await metadataRepo.updateIngestJob(job.id, { status: 'running', stage: 'index' });
-        const ingested = await ingestDocumentsToIndex(env, repo, tenant, indexId, docs, body.chunking);
+        const ingested = await ingestDocumentsToIndex(env, repo, tenant, indexId, docs, body.chunking, operation);
         const chunkPreview = chunkPreviewFromChunks(ingested.flatMap((entry) => entry.chunks));
         await metadataRepo.insertKbChunks(
           ingested.flatMap((entry) =>
@@ -942,7 +1098,7 @@ export function createRuntime(options: AppOptions = {}) {
         let structured = { entities: 0, mentions: 0, relationships: 0, provenance_spans: 0, chunks_linked: 0 };
         if (activeSchema) {
           await metadataRepo.updateIngestJob(job.id, { status: 'running', stage: 'extract' });
-          structured = await metadataRepo.recordStructuredEntities({
+          const structuredInput = {
             project: tenant,
             domain,
             fileId: file.id,
@@ -960,9 +1116,15 @@ export function createRuntime(options: AppOptions = {}) {
                   ]
                 : [];
             }),
-          });
+          };
+          structured =
+            operation && metadataRepo.stageOwnedStructuredEntities
+              ? await metadataRepo.stageOwnedStructuredEntities(structuredInput, operation)
+              : await metadataRepo.recordStructuredEntities(structuredInput);
         }
-        await metadataRepo.setFileStatus(tenant, file.id, 'ready');
+        if (operation) {
+          if (!(await completeOwnedOperation(env, operation))) throw new HTTPException(409, { message: 'File removed during ingestion.' });
+        } else await metadataRepo.setFileStatus(tenant, file.id, 'ready');
         await metadataRepo.updateIngestJob(job.id, { status: 'succeeded', stage: 'indexed', lockedBy: null });
         console.log('knowledgebase ingest file succeeded', {
           job_id: job.id,
@@ -991,7 +1153,9 @@ export function createRuntime(options: AppOptions = {}) {
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        await metadataRepo.setFileStatus(tenant, file.id, 'failed', message);
+        if (operation) {
+          if (!(error instanceof UnsettledFileWrite)) await abortOwnedOperation(env, operation);
+        } else await metadataRepo.setFileStatus(tenant, file.id, 'failed', message);
         await metadataRepo.updateIngestJob(job.id, {
           status: 'failed',
           error: message,
@@ -1180,6 +1344,7 @@ export function createRuntime(options: AppOptions = {}) {
     const answerCacheKey = sessionId
       ? null
       : buildCacheKey({
+          revision: await durableRevision(c.env, tenant),
           tenant,
           domain,
           indexId: index.id,
@@ -1351,7 +1516,7 @@ export function createRuntime(options: AppOptions = {}) {
       return { data: [] };
     }
     const metadataResults = matches.map(searchResultFromVectorMetadata);
-    if (metadataResults.every(Boolean)) {
+    if (!options.ownedFileProtocol && metadataResults.every(Boolean)) {
       if (timing) timing.hydrate_ms = 0;
       return { data: metadataResults.filter((result): result is SearchResult => Boolean(result)) };
     }
@@ -1468,6 +1633,17 @@ export function createRuntime(options: AppOptions = {}) {
     setSharedEmbeddingCache,
     clearKbDomainCaches,
     deleteKbFiles,
+    storeRawFile,
+    registerStoredFile,
+    persistParse,
+    beginOwnedOperation,
+    completeOwnedOperation,
+    abortOwnedOperation,
+    ownedDeletion,
+    listDeletionFiles,
+    ownedParseLookup,
+    genericOwnershipConflict,
+    ownedIndexHasFiles,
     relationshipsWithEntityNames,
     persistSharedQueryCache,
     getCachedLexicalChunks,

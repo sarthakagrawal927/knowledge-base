@@ -54,6 +54,12 @@ export function registerIngestRoutes(app: App, rt: AppRuntime): void {
   const {
     makeRepository,
     makeMetadataRepository,
+    storeRawFile,
+    persistParse,
+    beginOwnedOperation,
+    completeOwnedOperation,
+    abortOwnedOperation,
+    ownedParseLookup,
     clearKbDomainCaches,
     applyKbDomainEmbeddingSelection,
     ensureKbIndex,
@@ -131,7 +137,7 @@ export function registerIngestRoutes(app: App, rt: AppRuntime): void {
     const contentHash = await sha256Hex(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
     const filename = virtualInputFilename('records', entityType.toLowerCase(), 'json', contentHash);
     const objectKey = `raw/${safeObjectKeySegment(domain)}/${contentHash}`;
-    await c.env.RAW_DOCS.put(objectKey, bytes, {
+    const rawOptions = {
       httpMetadata: { contentType: 'application/json' },
       customMetadata: {
         filename,
@@ -140,17 +146,22 @@ export function registerIngestRoutes(app: App, rt: AppRuntime): void {
         content_hash: contentHash,
         source: 'record',
       },
-    });
-    const file = await metadataRepo.registerFile({
-      id: crypto.randomUUID(),
-      project: tenant,
-      domain,
-      filename,
-      mime: 'application/json',
-      bytes: bytes.byteLength,
-      contentHash,
-      objectKey,
-    });
+    };
+    const file = await storeRawFile(
+      c.env,
+      {
+        id: crypto.randomUUID(),
+        project: tenant,
+        domain,
+        filename,
+        mime: 'application/json',
+        bytes: bytes.byteLength,
+        contentHash,
+        objectKey,
+      },
+      bytes,
+      rawOptions,
+    );
     const replayRoute = `/v1/kb/files/${file.id}/reprocess`;
     if (file.status === 'ready') {
       return c.json(
@@ -175,6 +186,7 @@ export function registerIngestRoutes(app: App, rt: AppRuntime): void {
         200,
       );
     }
+    const operation = await beginOwnedOperation(c.env, tenant, file.id);
     await metadataRepo.setFileStatus(tenant, file.id, 'indexing');
     const artifactKey = parseArtifactKey(domain, contentHash);
     const docs = records.map((record, i) => ({
@@ -191,51 +203,57 @@ export function registerIngestRoutes(app: App, rt: AppRuntime): void {
         source: 'record',
       } as JsonRecord,
     }));
-    await c.env.RAW_DOCS.put(
-      artifactKey,
-      JSON.stringify({
-        parser: 'worker-direct-record-v1',
-        parser_version: '1',
+    const parseContent = JSON.stringify({
+      parser: 'worker-direct-record-v1',
+      parser_version: '1',
+      project: tenant,
+      domain,
+      file_id: file.id,
+      filename,
+      content_hash: contentHash,
+      record_count: records.length,
+      document_count: docs.length,
+      documents: docs,
+    });
+    const parseOptions = {
+      httpMetadata: { contentType: 'application/json' },
+      customMetadata: {
         project: tenant,
         domain,
         file_id: file.id,
-        filename,
         content_hash: contentHash,
-        record_count: records.length,
-        document_count: docs.length,
-        documents: docs,
-      }),
-      {
-        httpMetadata: { contentType: 'application/json' },
-        customMetadata: {
-          project: tenant,
-          domain,
-          file_id: file.id,
-          content_hash: contentHash,
-          parser: 'worker-direct-record-v1',
-        },
+        parser: 'worker-direct-record-v1',
       },
+    };
+    await persistParse(
+      c.env,
+      operation,
+      {
+        contentHash,
+        parser: 'worker-direct-record-v1',
+        parserVersion: '1',
+        objectKey: artifactKey,
+        pageCount: 1,
+      },
+      parseContent,
+      parseOptions,
     );
-    await metadataRepo.upsertParseArtifact({
-      contentHash,
-      parser: 'worker-direct-record-v1',
-      parserVersion: '1',
-      objectKey: artifactKey,
-      pageCount: 1,
-    });
     const ragRepo = makeRepository(c.env);
     let indexId: string;
     let ingested: { document_id: string; chunks: CreateChunkInput[] }[];
     try {
       indexId = await ensureKbIndex(c.env, ragRepo, tenant, domain);
-      ingested = await ingestDocumentsToIndex(c.env, ragRepo, tenant, indexId, docs);
+      ingested = await ingestDocumentsToIndex(c.env, ragRepo, tenant, indexId, docs, undefined, operation);
     } catch (error) {
       const payload = embeddingReadinessErrorJson(error, {
         idempotencyKey: body.idempotency_key,
         contentHash,
         replayRoute,
       });
-      if (payload) return c.json(payload, 400);
+      if (payload) {
+        await abortOwnedOperation(c.env, operation);
+        return c.json(payload, 400);
+      }
       throw error;
     }
     const chunkPreview = chunkPreviewFromChunks(ingested.flatMap((entry) => entry.chunks));
@@ -271,7 +289,7 @@ export function registerIngestRoutes(app: App, rt: AppRuntime): void {
     };
     let structuredFailure: JsonRecord | null = null;
     try {
-      structured = await metadataRepo.recordStructuredEntities({
+      const structuredInput = {
         project: tenant,
         domain,
         fileId: file.id,
@@ -282,11 +300,21 @@ export function registerIngestRoutes(app: App, rt: AppRuntime): void {
           record,
           chunks: ingested[i]?.chunks.map((chunk) => ({ id: chunk.id, content: chunk.content })) ?? [],
         })),
-      });
+      };
+      structured =
+        operation && metadataRepo.stageOwnedStructuredEntities
+          ? await metadataRepo.stageOwnedStructuredEntities(structuredInput, operation)
+          : await metadataRepo.recordStructuredEntities(structuredInput);
     } catch (error) {
       structuredFailure = classifyIngestFailure(error);
     }
-    await metadataRepo.setFileStatus(tenant, file.id, 'ready');
+    if (operation) {
+      if (structuredFailure || chunkMetadataFailure) {
+        await abortOwnedOperation(c.env, operation);
+        return c.json({ error: 'Owned metadata publication failed; retry or delete this file.' }, 500);
+      }
+      if (!(await completeOwnedOperation(c.env, operation))) return c.json({ error: 'File removed during ingestion.' }, 409);
+    } else await metadataRepo.setFileStatus(tenant, file.id, 'ready');
     let cacheClearFailure: JsonRecord | null = null;
     try {
       await clearKbDomainCaches(c.env, tenant, domain);
@@ -354,7 +382,7 @@ export function registerIngestRoutes(app: App, rt: AppRuntime): void {
     const contentHash = await sha256Hex(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
     const filename = virtualInputFilename('text', body.title?.trim() || 'untitled', 'txt', contentHash);
     const objectKey = `raw/${safeObjectKeySegment(domain)}/${contentHash}`;
-    await c.env.RAW_DOCS.put(objectKey, bytes, {
+    const rawOptions = {
       httpMetadata: { contentType: 'text/plain' },
       customMetadata: {
         filename,
@@ -363,17 +391,22 @@ export function registerIngestRoutes(app: App, rt: AppRuntime): void {
         content_hash: contentHash,
         ...(body.type ? { entity_type_hint: body.type } : {}),
       },
-    });
-    const file = await metadataRepo.registerFile({
-      id: crypto.randomUUID(),
-      project: tenant,
-      domain,
-      filename,
-      mime: 'text/plain',
-      bytes: bytes.byteLength,
-      contentHash,
-      objectKey,
-    });
+    };
+    const file = await storeRawFile(
+      c.env,
+      {
+        id: crypto.randomUUID(),
+        project: tenant,
+        domain,
+        filename,
+        mime: 'text/plain',
+        bytes: bytes.byteLength,
+        contentHash,
+        objectKey,
+      },
+      bytes,
+      rawOptions,
+    );
     const replayRoute = `/v1/kb/files/${file.id}/reprocess`;
     if (file.status === 'ready') {
       return c.json(
@@ -517,6 +550,12 @@ export function registerIngestRoutes(app: App, rt: AppRuntime): void {
   app.get('/v1/kb/parse-artifacts/:hash', async (c) => {
     const repo = makeMetadataRepository(c.env);
     const hash = c.req.param('hash');
+    const scoped = await ownedParseLookup(c.env, c.get('tenant'), hash, c.req.query('file_id'));
+    if (scoped) {
+      if (scoped.ambiguous) return c.json({ error: 'Multiple files match; specify file_id.' }, 409);
+      if (!scoped.artifact) return c.json({ error: 'parse artifact not found' }, 404);
+      return c.json(scoped.artifact);
+    }
     const owned = await repo.hasFileWithContentHash(c.get('tenant'), hash);
     if (!owned) return c.json({ error: 'parse artifact not found' }, 404);
     const artifact = await repo.getParseArtifact(hash);

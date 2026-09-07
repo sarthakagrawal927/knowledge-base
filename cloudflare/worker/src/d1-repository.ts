@@ -32,7 +32,17 @@ function escapeLikeToken(token: string): string {
 }
 
 export class D1Repository implements Repository {
-  constructor(private readonly db: D1Database) {}
+  constructor(
+    private readonly db: D1Database,
+    private readonly ownedFileReads = false,
+  ) {}
+
+  private get documentsTable(): string {
+    return this.ownedFileReads ? 'kb_visible_documents' : 'documents';
+  }
+  private get chunksTable(): string {
+    return this.ownedFileReads ? 'kb_visible_chunks' : 'chunks';
+  }
 
   async createIndex(input: CreateIndexInput): Promise<IndexRecord> {
     await this.db
@@ -99,7 +109,8 @@ export class D1Repository implements Repository {
       )
       .bind(input.id, input.indexId, input.tenant, input.externalId, input.content, JSON.stringify(input.metadata))
       .run();
-    const created = await this.getDocument(input.tenant, input.id);
+    const row = await this.db.prepare('SELECT * FROM documents WHERE tenant = ? AND id = ?').bind(input.tenant, input.id).first<StoredDocument>();
+    const created = row ? rowToDocument(row) : null;
     if (!created) throw new Error('failed to create document');
     return created;
   }
@@ -108,7 +119,7 @@ export class D1Repository implements Repository {
     const result = await this.db
       .prepare(
         `SELECT id, index_id, tenant, external_id, content, metadata, created_at
-           FROM documents
+           FROM ${this.documentsTable}
           WHERE tenant = ? AND index_id = ?
           ORDER BY created_at DESC
           LIMIT ? OFFSET ?`,
@@ -122,7 +133,7 @@ export class D1Repository implements Repository {
     const row = await this.db
       .prepare(
         `SELECT id, index_id, tenant, external_id, content, metadata, created_at
-           FROM documents
+           FROM ${this.documentsTable}
           WHERE tenant = ? AND id = ?`,
       )
       .bind(tenant, id)
@@ -164,7 +175,7 @@ export class D1Repository implements Repository {
     const result = await this.db
       .prepare(
         `SELECT id, document_id, index_id, tenant, content, chunk_index, metadata, created_at
-           FROM chunks
+           FROM ${this.chunksTable}
           WHERE tenant = ? AND id IN (${placeholders})`,
       )
       .bind(tenant, ...ids)
@@ -176,7 +187,7 @@ export class D1Repository implements Repository {
     const result = await this.db
       .prepare(
         `SELECT id, document_id, index_id, tenant, content, chunk_index, metadata, created_at
-           FROM chunks
+           FROM ${this.chunksTable}
           WHERE tenant = ? AND index_id = ?
           ORDER BY chunk_index ASC
           LIMIT ?`,
@@ -195,7 +206,7 @@ export class D1Repository implements Repository {
       .prepare(
         `SELECT id, document_id, index_id, tenant, content, chunk_index, metadata, created_at,
                 (${scoreExpr}) AS lexical_score
-           FROM chunks
+           FROM ${this.chunksTable}
           WHERE tenant = ? AND index_id = ? AND (${whereExpr})
           ORDER BY lexical_score DESC, chunk_index ASC
           LIMIT ?`,

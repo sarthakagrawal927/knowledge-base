@@ -86,6 +86,7 @@ export interface VectorizeBinding {
     },
   ): Promise<{ matches: VectorizeMatch[] }>;
   deleteByIds(ids: string[]): Promise<unknown>;
+  getByIds?(ids: string[]): Promise<Array<{ id: string }>>;
 }
 
 export interface IndexRecord {

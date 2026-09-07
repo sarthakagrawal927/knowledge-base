@@ -49,10 +49,33 @@ import type { Env, JsonRecord } from '../types';
 
 type App = Hono<{ Bindings: Env; Variables: Variables }>;
 
+function fileDeletionPayload(deleted: Awaited<ReturnType<AppRuntime['deleteKbFiles']>>) {
+  return {
+    affected_files: deleted.deletedFiles.length,
+    deleted_files: deleted.deletedFiles,
+    deleted_vectors: deleted.deletedVectors,
+    ...(deleted.pending
+      ? {
+          pending_files: deleted.pending,
+          logical_removed: true,
+          physical_scope: 'indexed_file_artifacts',
+          history_retained: true,
+          message: deleted.pending.length
+            ? 'Files hidden from search; artifact cleanup is pending. Saved conversations and query traces remain.'
+            : 'Indexed file artifacts removed. Saved conversations and query traces remain.',
+        }
+      : {}),
+  };
+}
+
 export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
   const {
     makeRepository,
     makeMetadataRepository,
+    storeRawFile,
+    registerStoredFile,
+    ownedDeletion,
+    listDeletionFiles,
     rememberIndexRecord,
     deleteKbFiles,
     resolveKbDomainEmbeddingSelection,
@@ -362,7 +385,7 @@ export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
     const bytes = await uploaded.arrayBuffer();
     const contentHash = await sha256Hex(bytes);
     const objectKey = `raw/${safeObjectKeySegment(domain)}/${contentHash}`;
-    await c.env.RAW_DOCS.put(objectKey, bytes, {
+    const rawOptions = {
       httpMetadata: { contentType: uploaded.type || 'application/octet-stream' },
       customMetadata: {
         filename: uploaded.name || 'file',
@@ -370,18 +393,23 @@ export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
         domain,
         content_hash: contentHash,
       },
-    });
+    };
     const repo = makeMetadataRepository(c.env);
-    const file = await repo.registerFile({
-      id: crypto.randomUUID(),
-      project: tenant,
-      domain,
-      filename: uploaded.name || 'file',
-      mime: uploaded.type || null,
-      bytes: uploaded.size,
-      contentHash,
-      objectKey,
-    });
+    const file = await storeRawFile(
+      c.env,
+      {
+        id: crypto.randomUUID(),
+        project: tenant,
+        domain,
+        filename: uploaded.name || 'file',
+        mime: uploaded.type || null,
+        bytes: uploaded.size,
+        contentHash,
+        objectKey,
+      },
+      bytes,
+      rawOptions,
+    );
     await repo.upsertIngestJob({
       project: tenant,
       domain,
@@ -488,7 +516,7 @@ export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
     const readiness = await validateKbSchedulingReadiness(c, c.get('tenant'), body.domain);
     if (readiness) return readiness;
     const repo = makeMetadataRepository(c.env);
-    const file = await repo.registerFile({
+    const file = await registerStoredFile(c.env, {
       id: crypto.randomUUID(),
       project: c.get('tenant'),
       ...body,
@@ -548,16 +576,34 @@ export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
   app.delete('/v1/kb/files/:file_id', async (c) => {
     const tenant = c.get('tenant');
     const repo = makeMetadataRepository(c.env);
+    const owned = await ownedDeletion(c.env, tenant, c.req.param('file_id'));
+    if (owned)
+      return c.json(
+        {
+          project: tenant,
+          file_id: c.req.param('file_id'),
+          logical_removed: true,
+          physical_state: owned,
+          physical_scope: 'indexed_file_artifacts',
+          history_retained: true,
+          message:
+            owned === 'pending'
+              ? 'File hidden from search; artifact cleanup is pending. Saved conversations and query traces remain.'
+              : 'Indexed file artifacts removed. Saved conversations and query traces remain.',
+        },
+        owned === 'pending' ? 202 : 200,
+      );
     const file = await repo.getFile(tenant, c.req.param('file_id'));
     if (!file) return c.json({ error: 'file not found' }, 404);
     const deleted = await deleteKbFiles(c.env, tenant, [file]);
     if (deleted.blocked) return c.json({ error: deleted.blocked, message: 'Deletion is blocked because storage is shared. No file was removed.' }, 409);
-    return c.json({
-      project: tenant,
-      affected_files: deleted.deletedFiles.length,
-      deleted_files: deleted.deletedFiles,
-      deleted_vectors: deleted.deletedVectors,
-    });
+    return c.json(
+      {
+        project: tenant,
+        ...fileDeletionPayload(deleted),
+      },
+      deleted.pending?.length ? 202 : 200,
+    );
   });
 
   app.post('/v1/kb/files/upload', async (c) => {
@@ -579,7 +625,7 @@ export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
     const safeDomain = safeObjectKeySegment(domain);
     const filename = uploaded.name || 'file';
     const objectKey = `raw/${safeDomain}/${contentHash}`;
-    await c.env.RAW_DOCS.put(objectKey, bytes, {
+    const rawOptions = {
       httpMetadata: { contentType: uploaded.type || 'application/octet-stream' },
       customMetadata: {
         filename,
@@ -587,19 +633,24 @@ export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
         domain,
         content_hash: contentHash,
       },
-    });
+    };
 
     const repo = makeMetadataRepository(c.env);
-    const file = await repo.registerFile({
-      id: crypto.randomUUID(),
-      project: tenant,
-      domain,
-      filename,
-      mime: uploaded.type || null,
-      bytes: uploaded.size,
-      contentHash,
-      objectKey,
-    });
+    const file = await storeRawFile(
+      c.env,
+      {
+        id: crypto.randomUUID(),
+        project: tenant,
+        domain,
+        filename,
+        mime: uploaded.type || null,
+        bytes: uploaded.size,
+        contentHash,
+        objectKey,
+      },
+      bytes,
+      rawOptions,
+    );
     await repo.upsertIngestJob({
       project: tenant,
       domain,
@@ -683,7 +734,7 @@ export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
       if (input.bytes.byteLength > 10_000_000) throw new Error('response exceeds 10 MB source import limit');
       const contentHash = await sha256Hex(input.bytes);
       const objectKey = `raw/${safeObjectKeySegment(domain)}/${contentHash}`;
-      await c.env.RAW_DOCS!.put(objectKey, input.bytes, {
+      const rawOptions = {
         httpMetadata: { contentType: input.mime ?? 'application/octet-stream' },
         customMetadata: {
           filename: input.filename,
@@ -693,17 +744,22 @@ export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
           source: input.source,
           ...input.metadata,
         },
-      });
-      const file = await metadataRepo.registerFile({
-        id: crypto.randomUUID(),
-        project: tenant,
-        domain,
-        filename: input.filename,
-        mime: input.mime,
-        bytes: input.bytes.byteLength,
-        contentHash,
-        objectKey,
-      });
+      };
+      const file = await storeRawFile(
+        c.env,
+        {
+          id: crypto.randomUUID(),
+          project: tenant,
+          domain,
+          filename: input.filename,
+          mime: input.mime,
+          bytes: input.bytes.byteLength,
+          contentHash,
+          objectKey,
+        },
+        input.bytes,
+        rawOptions,
+      );
       files.push(file);
       if (body.auto_ingest !== false) {
         jobs.push(
@@ -870,7 +926,10 @@ export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
     if (!allowed.has(action)) return c.json({ error: 'unsupported source-set action' }, 400);
     const tenant = c.get('tenant');
     const metadataRepo = makeMetadataRepository(c.env);
-    const files = filesForSourceSetAction(await metadataRepo.listFiles(tenant, domain), action);
+    const files = filesForSourceSetAction(
+      await (action.startsWith('delete_') ? listDeletionFiles(c.env, tenant, domain) : metadataRepo.listFiles(tenant, domain)),
+      action,
+    );
     if (body.dry_run) {
       return c.json({
         project: tenant,
@@ -909,13 +968,14 @@ export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
     }
     const deleted = await deleteKbFiles(c.env, tenant, files);
     if (deleted.blocked) return c.json({ error: deleted.blocked, message: 'Deletion is blocked because storage is shared. No file was removed.' }, 409);
-    return c.json({
-      project: tenant,
-      source_set_id: id,
-      action,
-      affected_files: deleted.deletedFiles.length,
-      deleted_files: deleted.deletedFiles,
-      deleted_vectors: deleted.deletedVectors,
-    });
+    return c.json(
+      {
+        project: tenant,
+        source_set_id: id,
+        action,
+        ...fileDeletionPayload(deleted),
+      },
+      deleted.pending?.length ? 202 : 200,
+    );
   });
 }

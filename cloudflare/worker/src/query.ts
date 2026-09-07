@@ -1009,14 +1009,15 @@ export function strongLexicalFastPath(payload: QueryPayload | null): boolean {
 }
 
 export function searchResultFromEntity(entity: EntityRecord, score: number, route = 'd1_entities', extraMetadata: JsonRecord = {}): SearchResult {
-  const content = JSON.stringify(entity.fields, null, 2);
+  const content = entity.evidence_text || JSON.stringify(entity.fields, null, 2);
   return {
     document_id: entity.id,
-    chunk_id: entity.id,
+    chunk_id: entity.evidence_chunk_id || entity.id,
     chunk_content: content,
     score,
     metadata: {
       route,
+      ...(entity.file_id ? { file_id: entity.file_id, file_generation: entity.file_generation, filename: entity.filename, page_start: 1, page_end: 1 } : {}),
       entity_id: entity.id,
       entity_type: entity.type,
       identity_key: entity.identity_key,

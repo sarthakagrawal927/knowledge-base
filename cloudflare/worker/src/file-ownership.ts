@@ -135,16 +135,31 @@ export class D1FileOwnership {
     return result.meta.changes === 1;
   }
 
-  // Call only after all external calls have returned. Publication and settlement
-  // are one SQL transaction, but no external provider participates in it.
-  async settle(operation: FileOperation, publish: boolean): Promise<boolean> {
-    const results = await this.db.batch([
-      this.db
-        .prepare(`UPDATE kb_file_lifecycle SET state = 'active', published_generation = generation, updated_at = datetime('now')
-        WHERE project = ? AND file_id = ? AND generation = ? AND active_operation_id = ?
-        AND state IN ('uploading', 'active') AND ? = 1
-        AND EXISTS (SELECT 1 FROM kb_file_operations WHERE operation_id = ? AND state = 'running')`)
-        .bind(operation.project, operation.file_id, operation.generation, operation.operation_id, Number(publish), operation.operation_id),
+  // Call only after all external calls have returned. The SQL guard makes
+  // metadata statements and publication one transaction, rejecting stale work.
+  async publish(operation: FileOperation, statements: D1PreparedStatement[] = []): Promise<boolean> {
+    try {
+      await this.db.batch([
+        this.db
+          .prepare('INSERT INTO kb_file_publications(operation_id, project, file_id, generation) VALUES (?, ?, ?, ?)')
+          .bind(operation.operation_id, operation.project, operation.file_id, operation.generation),
+        ...statements,
+        this.db
+          .prepare(`UPDATE kb_file_lifecycle SET state = 'active', published_generation = generation, updated_at = datetime('now')
+          WHERE project = ? AND file_id = ? AND generation = ? AND active_operation_id = ?`)
+          .bind(operation.project, operation.file_id, operation.generation, operation.operation_id),
+        ...this.settlementStatements(operation),
+      ]);
+      return true;
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('file_operation_not_publishable')) throw error;
+      await this.settle(operation, false);
+      return false;
+    }
+  }
+
+  private settlementStatements(operation: FileOperation): D1PreparedStatement[] {
+    return [
       this.db
         .prepare(`UPDATE kb_file_operations SET state = 'settled', settled_at = datetime('now')
         WHERE project = ? AND operation_id = ? AND state = 'running'`)
@@ -153,8 +168,21 @@ export class D1FileOwnership {
         .prepare(`UPDATE kb_file_lifecycle SET active_operation_id = NULL, updated_at = datetime('now')
         WHERE project = ? AND file_id = ? AND active_operation_id = ?`)
         .bind(operation.project, operation.file_id, operation.operation_id),
-    ]);
-    return results[0]?.meta.changes === 1;
+    ];
+  }
+
+  async settle(operation: FileOperation, publish: boolean): Promise<boolean> {
+    if (publish) return await this.publish(operation);
+    await this.db.batch(this.settlementStatements(operation));
+    return false;
+  }
+
+  async scopeRevision(project: string, domain: string): Promise<number> {
+    const row = await this.db
+      .prepare('SELECT revision FROM kb_scope_revisions WHERE project = ? AND domain = ?')
+      .bind(project, domain)
+      .first<{ revision: number }>();
+    return row?.revision ?? 0;
   }
 
   async requestDelete(project: string, fileId: string, deletionId: string): Promise<FileLifecycle | null> {
@@ -165,6 +193,14 @@ export class D1FileOwnership {
       .bind(deletionId, project, fileId)
       .run();
     return await this.get(project, fileId);
+  }
+
+  async confirmVectorVisible(project: string, artifactId: string): Promise<void> {
+    await this.db
+      .prepare(`UPDATE kb_file_artifacts SET write_state = 'confirmed'
+      WHERE project = ? AND artifact_id = ? AND kind = 'vector' AND cleanup_state = 'pending'`)
+      .bind(project, artifactId)
+      .run();
   }
 
   async cleanupCandidates(project: string, fileId: string): Promise<FileArtifact[]> {

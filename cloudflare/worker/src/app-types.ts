@@ -53,6 +53,8 @@ export type QueueCapableApp = WorkerApp & {
 };
 
 export interface AppOptions {
+  /** Internal qualification gate. Production defaults to legacy until every writer is covered. */
+  ownedFileProtocol?: boolean;
   makeRepository?: (env: Env) => Repository;
   makeMetadataRepository?: (env: Env) => MetadataRepository;
   embed?: (env: Env, texts: string[], options?: EmbeddingCallOptions) => Promise<number[][]>;

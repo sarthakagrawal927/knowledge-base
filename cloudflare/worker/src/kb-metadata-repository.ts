@@ -1,3 +1,4 @@
+import type { FileOperation } from './file-ownership';
 import type { CitationRecord, JsonRecord, SearchResult } from './types';
 import type { DomainSchema } from './schema-inference';
 
@@ -142,6 +143,11 @@ export interface KbChunkRecord {
 }
 
 export interface EntityRecord {
+  file_id?: string | null;
+  file_generation?: number | null;
+  filename?: string | null;
+  evidence_chunk_id?: string | null;
+  evidence_text?: string | null;
   id: string;
   project: string;
   domain: string;
@@ -336,6 +342,7 @@ export interface MetadataRepository {
   getIngestJob(project: string, id: string): Promise<IngestJobRecord | null>;
   insertKbChunks(chunks: KbChunkInput[]): Promise<void>;
   recordStructuredEntities(input: RecordStructuredEntitiesInput): Promise<RecordStructuredEntitiesResult>;
+  stageOwnedStructuredEntities?(input: RecordStructuredEntitiesInput, operation: FileOperation): Promise<RecordStructuredEntitiesResult>;
   backfillEntityRelationships(project: string, schema: SchemaRecord): Promise<BackfillEntityRelationshipsResult>;
   listEntities(project: string, domain?: string, type?: string, limit?: number): Promise<EntityRecord[]>;
   getEntity(project: string, id: string): Promise<EntityRecord | null>;
@@ -606,13 +613,20 @@ function relationshipCandidatesForRecord(
   return out;
 }
 
-async function persistedIdentityLookup(db: D1Database, project: string, domain: string, types: string[], defaultType: string): Promise<Map<string, string>> {
+async function persistedIdentityLookup(
+  db: D1Database,
+  project: string,
+  domain: string,
+  types: string[],
+  defaultType: string,
+  entityTable = 'kb_entities',
+): Promise<Map<string, string>> {
   const identities = new Map<string, string>();
   for (const type of types) {
     const rows = await db
       .prepare(
         `SELECT id, type, identity_key, display_name
-           FROM kb_entities
+           FROM ${entityTable}
           WHERE project = ? AND domain = ? AND type = ?
           LIMIT 10000`,
       )
@@ -632,7 +646,23 @@ function excerptForField(name: string, value: unknown): string {
 }
 
 export class D1MetadataRepository implements MetadataRepository {
-  constructor(private readonly db: D1Database) {}
+  constructor(
+    private readonly db: D1Database,
+    private readonly ownedFileReads = false,
+  ) {}
+
+  private get entityTable(): string {
+    return this.ownedFileReads ? 'kb_visible_entities' : 'kb_entities';
+  }
+  private get relationshipTable(): string {
+    return this.ownedFileReads ? 'kb_visible_relationships' : 'kb_entity_relationships';
+  }
+  private get mentionsTable(): string {
+    return this.ownedFileReads ? 'kb_visible_entity_mentions' : 'kb_entity_mentions';
+  }
+  private get filesTable(): string {
+    return this.ownedFileReads ? 'kb_visible_files' : 'kb_files';
+  }
 
   async ensureProject(project: string): Promise<void> {
     await this.db
@@ -913,7 +943,7 @@ export class D1MetadataRepository implements MetadataRepository {
       .prepare(
         `SELECT id, project, domain, filename, mime, bytes, content_hash,
                 canonical_hash, object_key, status, last_error, uploaded_at, updated_at
-           FROM kb_files
+           FROM ${this.filesTable}
           WHERE ${clauses.join(' AND ')}
           ORDER BY uploaded_at ASC`,
       )
@@ -927,7 +957,7 @@ export class D1MetadataRepository implements MetadataRepository {
       .prepare(
         `SELECT id, project, domain, filename, mime, bytes, content_hash,
                 canonical_hash, object_key, status, last_error, uploaded_at, updated_at
-           FROM kb_files
+           FROM ${this.filesTable}
           WHERE project = ? AND id = ?`,
       )
       .bind(project, id)
@@ -977,7 +1007,7 @@ export class D1MetadataRepository implements MetadataRepository {
       .prepare(
         `SELECT id, project, domain, file_id, vector_id, page_start, page_end,
                 text, content_hash, metadata
-           FROM kb_chunks
+           FROM ${this.ownedFileReads ? 'kb_visible_kb_chunks' : 'kb_chunks'}
           WHERE ${clauses.join(' AND ')}
           ORDER BY rowid DESC
           LIMIT ?`,
@@ -1217,6 +1247,116 @@ export class D1MetadataRepository implements MetadataRepository {
     );
   }
 
+  async stageOwnedStructuredEntities(input: RecordStructuredEntitiesInput, operation: FileOperation): Promise<RecordStructuredEntitiesResult> {
+    if (operation.project !== input.project || operation.file_id !== input.fileId) throw new Error('owned structured scope mismatch');
+    const entityTypes = input.schema.spec.entities;
+    const primary = entityTypes[0];
+    const empty = { entities: 0, mentions: 0, relationships: 0, provenance_spans: 0, chunks_linked: 0 };
+    if (!primary) return empty;
+    let provenanceSpans = 0;
+    let chunksLinked = 0;
+    const persisted: Array<{ id: string; type: string; record: JsonRecord; identityField: string; displayName: string }> = [];
+    for (const item of input.records) {
+      for (const entityType of entityTypes) {
+        const identityField = identityFieldForEntity(entityType);
+        const isPrimary = entityType.name === primary.name;
+        const identity = primitiveIdentity(item.record[identityField]) ?? (isPrimary ? `${input.fileId}:record:${item.recordIndex}` : null);
+        if (!identity) continue;
+        const existing = await this.findEntity(input.project, input.domain, entityType.name, identity);
+        await this.db
+          .prepare(`INSERT INTO kb_owned_entity_identities(id, project, domain, type, identity_key)
+          VALUES (?, ?, ?, ?, ?) ON CONFLICT(project, domain, type, identity_key) DO NOTHING`)
+          .bind(existing?.id ?? crypto.randomUUID(), input.project, input.domain, entityType.name, identity)
+          .run();
+        const row = await this.db
+          .prepare('SELECT id FROM kb_owned_entity_identities WHERE project = ? AND domain = ? AND type = ? AND identity_key = ?')
+          .bind(input.project, input.domain, entityType.name, identity)
+          .first<{ id: string }>();
+        if (!row) throw new Error('owned entity identity missing');
+        const fields = entityRecordFields(item.record, entityType, isPrimary);
+        const display = primitiveIdentity(item.record[entityType.summary_field ?? identityField]) ?? identity;
+        await this.db
+          .prepare(`INSERT INTO kb_owned_entity_facts
+          (id,project,domain,file_id,generation,operation_id,entity_id,schema_id,display_name,fields,record_index,is_primary,evidence_chunk_id,evidence_text)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(project,file_id,generation,entity_id,schema_id) DO UPDATE SET
+          display_name=excluded.display_name,fields=excluded.fields,evidence_chunk_id=excluded.evidence_chunk_id,evidence_text=excluded.evidence_text`)
+          .bind(
+            crypto.randomUUID(),
+            input.project,
+            input.domain,
+            input.fileId,
+            operation.generation,
+            operation.operation_id,
+            row.id,
+            input.schema.id,
+            display,
+            JSON.stringify(fields),
+            item.recordIndex,
+            Number(isPrimary),
+            item.chunks[0]?.id ?? null,
+            item.chunks[0]?.content ?? null,
+          )
+          .run();
+        const spans = Object.entries(fields)
+          .slice(0, 50)
+          .map(([field, value]) =>
+            this.db
+              .prepare(`INSERT OR IGNORE INTO kb_owned_provenance_spans
+          (id,project,domain,file_id,generation,operation_id,entity_id,field,page_start,page_end,excerpt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?)`)
+              .bind(
+                crypto.randomUUID(),
+                input.project,
+                input.domain,
+                input.fileId,
+                operation.generation,
+                operation.operation_id,
+                row.id,
+                field,
+                excerptForField(field, value),
+              ),
+          );
+        if (spans.length) {
+          await this.db.batch(spans);
+          provenanceSpans += spans.length;
+        }
+        if (isPrimary) chunksLinked += item.chunks.length;
+        persisted.push({ id: row.id, type: entityType.name, record: item.record, identityField, displayName: display });
+      }
+    }
+    const types = new Set(entityTypes.map((type) => type.name));
+    for (const relation of input.schema.spec.relationships) types.add(relation.to_type);
+    const lookup = await persistedIdentityLookup(this.db, input.project, input.domain, [...types], primary.name, this.entityTable);
+    for (const item of persisted) {
+      const identity = primitiveIdentity(item.record[item.identityField]);
+      if (identity) addEntityIdentity(lookup, item.type, identity, item.id, primary.name);
+      addEntityIdentity(lookup, item.type, item.displayName, item.id, primary.name);
+    }
+    let relationships = 0;
+    for (const item of persisted) {
+      for (const edge of relationshipCandidatesForRecord(item, input.schema.spec.relationships, primary.name, lookup)) {
+        await this.db
+          .prepare(`INSERT INTO kb_owned_relationship_facts
+          (id,project,domain,file_id,generation,operation_id,rel_type,src_id,dst_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project,file_id,generation,rel_type,src_id,dst_id) DO NOTHING`)
+          .bind(
+            crypto.randomUUID(),
+            input.project,
+            input.domain,
+            input.fileId,
+            operation.generation,
+            operation.operation_id,
+            edge.relType,
+            edge.srcId,
+            edge.dstId,
+          )
+          .run();
+        relationships += 1;
+      }
+    }
+    return { ...empty, entities: persisted.length, mentions: persisted.length, relationships, provenance_spans: provenanceSpans, chunks_linked: chunksLinked };
+  }
+
   async recordStructuredEntities(input: RecordStructuredEntitiesInput): Promise<RecordStructuredEntitiesResult> {
     const entityTypes = input.schema.spec.entities;
     const primaryType = entityTypes[0];
@@ -1263,7 +1403,7 @@ export class D1MetadataRepository implements MetadataRepository {
         const row = await this.db
           .prepare(
             `SELECT id
-               FROM kb_entities
+               FROM ${this.entityTable}
               WHERE project = ? AND domain = ? AND type = ? AND identity_key = ?`,
           )
           .bind(input.project, input.domain, entityType.name, identity)
@@ -1359,7 +1499,59 @@ export class D1MetadataRepository implements MetadataRepository {
     return { entities, mentions, relationships, provenance_spans: provenanceSpans, chunks_linked: chunksLinked };
   }
 
+  private async backfillOwnedRelationships(project: string, schema: SchemaRecord) {
+    const primary = schema.spec.entities[0];
+    const result = { scanned: 0, candidates: 0, inserted: 0, parents: 0 };
+    if (!primary) return result;
+    const types = new Set(schema.spec.entities.map((type) => type.name));
+    for (const relationship of schema.spec.relationships) types.add(relationship.to_type);
+    const lookup = await persistedIdentityLookup(this.db, project, schema.domain, [...types], primary.name, this.entityTable);
+    const rows = await this.db
+      .prepare(`SELECT f.*, i.type FROM kb_visible_entity_facts f JOIN kb_owned_entity_identities i ON i.id=f.entity_id
+      WHERE f.project=? AND f.domain=?`)
+      .bind(project, schema.domain)
+      .all<{
+        entity_id: string;
+        type: string;
+        fields: string;
+        file_id: string;
+        generation: number;
+        operation_id: string;
+      }>();
+    for (const row of rows.results) {
+      const type = schema.spec.entities.find((type) => type.name === row.type);
+      if (!type) continue;
+      result.scanned += 1;
+      const candidates = relationshipCandidatesForRecord(
+        { id: row.entity_id, type: row.type, record: parseJson<JsonRecord>(row.fields, {}), identityField: identityFieldForEntity(type) },
+        schema.spec.relationships,
+        primary.name,
+        lookup,
+      );
+      for (const edge of candidates) {
+        result.candidates += 1;
+        const inserted = await this.db
+          .prepare(`INSERT INTO kb_owned_relationship_facts(id,project,domain,file_id,generation,operation_id,rel_type,src_id,dst_id)
+          SELECT ?,project,domain,file_id,published_generation,?,?,?,? FROM kb_file_lifecycle
+          WHERE project=? AND file_id=? AND state='active' AND published_generation=?
+          ON CONFLICT(project,file_id,generation,rel_type,src_id,dst_id) DO NOTHING`)
+          .bind(crypto.randomUUID(), row.operation_id, edge.relType, edge.srcId, edge.dstId, project, row.file_id, row.generation)
+          .run();
+        result.inserted += inserted.meta.changes;
+        if (edge.relType === 'parent') result.parents += inserted.meta.changes;
+      }
+    }
+    if (result.inserted)
+      await this.db
+        .prepare(`INSERT INTO kb_scope_revisions(project,domain,revision) VALUES (?, ?, 1)
+      ON CONFLICT(project,domain) DO UPDATE SET revision=revision+1`)
+        .bind(project, schema.domain)
+        .run();
+    return result;
+  }
+
   async backfillEntityRelationships(project: string, schema: SchemaRecord): Promise<BackfillEntityRelationshipsResult> {
+    const owned = this.ownedFileReads ? await this.backfillOwnedRelationships(project, schema) : { scanned: 0, candidates: 0, inserted: 0, parents: 0 };
     const primaryType = schema.spec.entities[0];
     if (!primaryType) {
       return {
@@ -1377,8 +1569,7 @@ export class D1MetadataRepository implements MetadataRepository {
     for (const relationship of relationshipTypes) targetTypes.add(relationship.to_type);
     const rows = await this.db
       .prepare(
-        `SELECT id, project, domain, type, identity_key, display_name,
-                fields, parent_id, created_at, updated_at
+        `SELECT *
            FROM kb_entities
           WHERE project = ? AND domain = ?`,
       )
@@ -1432,10 +1623,10 @@ export class D1MetadataRepository implements MetadataRepository {
     return {
       project,
       domain: schema.domain,
-      scanned_entities: entities.length,
-      candidate_relationships: candidateRelationships,
-      relationships_inserted: relationshipsInserted,
-      parent_links_updated: parentLinksUpdated,
+      scanned_entities: entities.length + owned.scanned,
+      candidate_relationships: candidateRelationships + owned.candidates,
+      relationships_inserted: relationshipsInserted + owned.inserted,
+      parent_links_updated: parentLinksUpdated + owned.parents,
     };
   }
 
@@ -1453,9 +1644,8 @@ export class D1MetadataRepository implements MetadataRepository {
     values.push(Math.min(Math.max(Math.trunc(limit), 1), 500));
     const result = await this.db
       .prepare(
-        `SELECT id, project, domain, type, identity_key, display_name,
-                fields, parent_id, created_at, updated_at
-           FROM kb_entities
+        `SELECT *
+           FROM ${this.entityTable}
           WHERE ${clauses.join(' AND ')}
           ORDER BY updated_at DESC
           LIMIT ?`,
@@ -1468,9 +1658,8 @@ export class D1MetadataRepository implements MetadataRepository {
   async getEntity(project: string, id: string): Promise<EntityRecord | null> {
     const row = await this.db
       .prepare(
-        `SELECT id, project, domain, type, identity_key, display_name,
-                fields, parent_id, created_at, updated_at
-           FROM kb_entities
+        `SELECT *
+           FROM ${this.entityTable}
           WHERE project = ? AND id = ?`,
       )
       .bind(project, id)
@@ -1481,9 +1670,8 @@ export class D1MetadataRepository implements MetadataRepository {
   async findEntity(project: string, domain: string, type: string, identityKey: string): Promise<EntityRecord | null> {
     const row = await this.db
       .prepare(
-        `SELECT id, project, domain, type, identity_key, display_name,
-                fields, parent_id, created_at, updated_at
-           FROM kb_entities
+        `SELECT *
+           FROM ${this.entityTable}
           WHERE project = ? AND domain = ? AND type = ? AND identity_key = ?`,
       )
       .bind(project, domain, type, identityKey)
@@ -1497,11 +1685,11 @@ export class D1MetadataRepository implements MetadataRepository {
         .prepare(
           `WITH RECURSIVE anc(id, type, display_name, parent_id, depth) AS (
              SELECT id, type, display_name, parent_id, 0
-               FROM kb_entities
+               FROM ${this.entityTable}
               WHERE project = ? AND id = ?
              UNION ALL
              SELECT e.id, e.type, e.display_name, e.parent_id, anc.depth + 1
-               FROM kb_entities e
+               FROM ${this.entityTable} e
                JOIN anc ON e.id = anc.parent_id
               WHERE e.project = ?
            )
@@ -1514,7 +1702,7 @@ export class D1MetadataRepository implements MetadataRepository {
       this.db
         .prepare(
           `SELECT id, type, display_name
-             FROM kb_entities
+             FROM ${this.entityTable}
             WHERE project = ? AND parent_id = ?
             ORDER BY type, display_name`,
         )
@@ -1523,8 +1711,8 @@ export class D1MetadataRepository implements MetadataRepository {
       this.db
         .prepare(
           `SELECT m.file_id, f.filename, m.confidence, m.field_values
-             FROM kb_entity_mentions m
-             JOIN kb_files f ON f.id = m.file_id
+             FROM ${this.mentionsTable} m
+             JOIN ${this.filesTable} f ON f.id = m.file_id
             WHERE m.project = ? AND m.entity_id = ?
             ORDER BY m.created_at DESC`,
         )
@@ -1562,9 +1750,8 @@ export class D1MetadataRepository implements MetadataRepository {
     values.push(Math.min(Math.max(Math.trunc(limit), 1), 100));
     const result = await this.db
       .prepare(
-        `SELECT id, project, domain, type, identity_key, display_name,
-                fields, parent_id, created_at, updated_at
-           FROM kb_entities
+        `SELECT *
+           FROM ${this.entityTable}
           WHERE project = ? AND domain = ? AND (${clauses.join(' OR ')})
           ORDER BY updated_at DESC
           LIMIT ?`,
@@ -1594,7 +1781,7 @@ export class D1MetadataRepository implements MetadataRepository {
       .prepare(
         `SELECT id, project, domain, rel_type, src_id, dst_id,
                 evidence_file, evidence_page, created_at
-           FROM kb_entity_relationships
+           FROM ${this.relationshipTable}
           WHERE ${clauses.join(' AND ')}
           ORDER BY created_at DESC
           LIMIT ?`,
