@@ -23,7 +23,9 @@ the non-negotiable product invariant.
 ## Timeline
 
 - **2026-09-08** — Added an offline read-only legacy ownership inventory over
-  an explicit SQLite snapshot. It identifies shared references, proposed owned
+  an explicit SQLite snapshot, plus verified offline raw-copy staging that
+  preserves source bytes and emits separate owned-key artifacts and a manifest.
+  The inventory identifies shared references, proposed owned
   keys and unresolved writers without copying or publishing records. Local
   migrated-SQLite and CLI tests cover tenant boundaries and unchanged input.
   This is preparation for issue 48; backfill, activation and live qualification

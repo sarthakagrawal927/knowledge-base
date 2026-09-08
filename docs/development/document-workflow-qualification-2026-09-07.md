@@ -170,3 +170,11 @@ From `cloudflare/worker`, run `pnpm inventory:legacy-ownership --database /path/
 The report preserves each tenant/file identity, counts shared raw keys and hashes across the supplied snapshot, proposes separate owned raw keys and identifies unresolved ingest jobs, running operations and inconsistent ledger metadata. It does not infer ownership from a `raw/v2/` prefix or settlement from operation age. Pre-ownership schemas are reported explicitly; missing files, unknown projects and partial ownership schemas fail.
 
 This is inventory preparation only. Even an empty report cannot prove completeness, drained writers, verified raw bytes, rebuilt parse/indexed provenance or provider convergence. Existing managed records are not certified healthy by this report. Byte-copy verification, backfill publication and uncertain-write reconciliation remain open in issue 48. Shared legacy objects must remain until a separate zero-reference cleanup review.
+
+### Verified offline raw staging
+
+From `cloudflare/worker`, `pnpm stage:legacy-raw --database /path/to/snapshot.sqlite --project PROJECT --object-root /path/to/object-export --output-root /path/to/staging` verifies the exported raw bytes against each file's recorded SHA-256 and size. The output directory must have an existing parent and be separate from the object export. The source export maps R2 keys to relative paths; absolute paths, dot segments and paths escaping the export are rejected.
+
+Each proposed owned key maps to a separate SHA-256-named `.bin` file, avoiding filesystem aliasing from identity characters. Outputs are created exclusively and reread; existing identical output is reusable, while conflicting output is retained and rejected. `manifest.json` records source/owned keys, verified hashes and sizes without document contents. Keep it private. Source bytes and the SQLite snapshot stay unchanged. Missing ownership migrations permit offline staging only; unresolved writers or inconsistent ownership still block it.
+
+Staging exported bytes does not establish current R2 contents, drained production writers, parse/indexed provenance or completed migration. The command does not upload, change metadata, publish, activate the owned protocol or delete shared legacy objects. Those requirements remain in issue 48.
