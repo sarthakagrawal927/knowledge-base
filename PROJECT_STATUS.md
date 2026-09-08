@@ -5,7 +5,7 @@
 > Update this file when durable current or shipped product truth changes. Do
 > not let deploy-version snapshots accumulate here — put those in the archive.
 
-Last updated: 2026-08-31
+Last updated: 2026-09-08
 
 ## Why / What
 
@@ -21,6 +21,13 @@ the non-negotiable product invariant.
 - Fleet consumers currently include Karte, Research Papers, and Starboard.
 
 ## Timeline
+
+- **2026-09-08** — Added an offline read-only legacy ownership inventory over
+  an explicit SQLite snapshot. It identifies shared references, proposed owned
+  keys and unresolved writers without copying or publishing records. Local
+  migrated-SQLite and CLI tests cover tenant boundaries and unchanged input.
+  This is preparation for issue 48; backfill, activation and live qualification
+  remain incomplete.
 
 - **2026-08-31** — Added source-ready product-owned Microsoft Clarity tracking
   to the public landing and disclosed both public analytics services in its

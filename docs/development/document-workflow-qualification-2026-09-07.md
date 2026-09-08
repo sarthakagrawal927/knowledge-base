@@ -162,3 +162,11 @@ settlement before physical completion. An elapsed lease alone is insufficient.
 Live binding convergence and an authorized synthetic consumer/operator journey
 remain unverified. No production migration, backfill, activation, deployment,
 hosted upload, provider/model call or new dependency was performed.
+
+## Read-only legacy inventory
+
+From `cloudflare/worker`, run `pnpm inventory:legacy-ownership --database /path/to/local-snapshot.sqlite --project PROJECT` against a complete administrative SQLite snapshot. The command opens the file read-only and reads a single transaction snapshot. It has no provider client or mutation mode. Treat the JSON output as private operational metadata.
+
+The report preserves each tenant/file identity, counts shared raw keys and hashes across the supplied snapshot, proposes separate owned raw keys and identifies unresolved ingest jobs, running operations and inconsistent ledger metadata. It does not infer ownership from a `raw/v2/` prefix or settlement from operation age. Pre-ownership schemas are reported explicitly; missing files, unknown projects and partial ownership schemas fail.
+
+This is inventory preparation only. Even an empty report cannot prove completeness, drained writers, verified raw bytes, rebuilt parse/indexed provenance or provider convergence. Existing managed records are not certified healthy by this report. Byte-copy verification, backfill publication and uncertain-write reconciliation remain open in issue 48. Shared legacy objects must remain until a separate zero-reference cleanup review.

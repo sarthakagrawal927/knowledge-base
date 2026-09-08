@@ -1,6 +1,11 @@
 import { DatabaseSync } from 'node:sqlite';
+import { inventoryLegacyOwnership } from '../scripts/inventory-legacy-ownership.mjs';
 import { URL } from 'node:url';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { D1FileOwnership, ownedParseKey, ownedRawKey, type FileOperation } from '../src/file-ownership';
 import { createApp } from '../src/index';
@@ -752,4 +757,79 @@ describe('inactive owned-file protocol with real migrated SQLite', () => {
     expect(sqlite.prepare('SELECT COUNT(*) AS n FROM kb_files').get()).toMatchObject({ n: 0 });
     expect(await ledger.get('tenant-a', 'a')).toBeNull();
   });
+});
+
+describe('legacy ownership inventory', () => {
+  it('keeps same-content tenants separate and reports cross-scope references without copying', () => {
+    const { sqlite } = fixture();
+    sqlite.exec(`INSERT INTO kb_files(id,project,domain,filename,mime,bytes,content_hash,object_key)
+      VALUES ('a','tenant-a','manual','a','text/plain',5,'same','raw/shared'),
+      ('b','tenant-b','manual','b','text/plain',5,'same','raw/shared'),
+      ('c','tenant-a','other','c','text/plain',5,'same','raw/shared');`);
+    const report = inventoryLegacyOwnership(sqlite, 'tenant-a');
+    expect(report.readyForBackfill).toBe(false);
+    expect(report.files).toHaveLength(2);
+    expect(report.files.map((f: { fileId: string }) => f.fileId)).toEqual(['a', 'c']);
+    expect(new Set(report.files.map((f: { proposedOwnedRawKey: string }) => f.proposedOwnedRawKey)).size).toBe(2);
+    for (const file of report.files) expect(file).toMatchObject({ rawReferenceCount: 3, hashReferenceCount: 3, disposition: 'legacy-copy-required' });
+    expect(sqlite.prepare('SELECT COUNT(*) AS n FROM kb_file_lifecycle').get()).toMatchObject({ n: 0 });
+    expect(sqlite.prepare("SELECT COUNT(*) AS n FROM kb_files WHERE object_key='raw/shared'").get()).toMatchObject({ n: 3 });
+    expect(() => inventoryLegacyOwnership(sqlite, 'missing')).toThrow('Project not found');
+    expect(() => inventoryLegacyOwnership(sqlite, '')).toThrow('explicit project');
+  });
+
+  it('does not infer ownership from keys or settlement from elapsed time', async () => {
+    const { sqlite, ledger } = fixture();
+    await uploaded(ledger);
+    await ledger.claim('tenant-a', 'a', 'never-finished', 'ingest');
+    sqlite.exec(`UPDATE kb_file_operations SET created_at='1900-01-01' WHERE operation_id='never-finished';
+      INSERT INTO kb_files(id,project,domain,filename,mime,bytes,content_hash,object_key)
+      VALUES ('fake','tenant-a','other','fake','text/plain',5,'fake','raw/v2/tenant-a/fake/fake');`);
+    const report = inventoryLegacyOwnership(sqlite, 'tenant-a');
+    expect(report.files[0]).toMatchObject({ disposition: 'blocked', runningOperations: 1, reasons: ['unsettled-writers'] });
+    expect(report.files[1]).toMatchObject({ disposition: 'blocked', reasons: ['owned-looking-key-without-ledger'] });
+    expect((await ledger.operation('tenant-a', 'never-finished'))?.state).toBe('running');
+  });
+});
+
+it('runs inventory CLI against a read-only snapshot without altering bytes and rejects missing inputs', () => {
+  const { sqlite } = fixture();
+  const directory = mkdtempSync(join(tmpdir(), 'kb-inventory-test-'));
+  const database = join(directory, 'snapshot.sqlite');
+  const command = fileURLToPath(new URL('../scripts/inventory-legacy-ownership.mjs', import.meta.url));
+  try {
+    sqlite.prepare('VACUUM INTO ?').run(database);
+    const before = readFileSync(database);
+    const run = spawnSync(process.execPath, [command, '--database', database, '--project', 'tenant-a'], { encoding: 'utf8' });
+    expect(run.status, run.stderr).toBe(0);
+    expect(JSON.parse(run.stdout)).toMatchObject({ project: 'tenant-a', readyForBackfill: false, files: [] });
+    expect(readFileSync(database)).toEqual(before);
+    const missing = spawnSync(process.execPath, [command, '--database', join(directory, 'missing.sqlite'), '--project', 'tenant-a'], { encoding: 'utf8' });
+    expect(missing.status).toBe(1);
+    expect(readdirSync(directory)).toEqual(['snapshot.sqlite']);
+  } finally {
+    rmSync(directory, { recursive: true });
+  }
+});
+
+it('reports pre-ownership schema and queued legacy jobs without creating a ledger', () => {
+  const sqlite = new DatabaseSync(':memory:');
+  databases.push(sqlite);
+  const migrations = new URL('../migrations/', import.meta.url);
+  for (const name of readdirSync(migrations)
+    .sort()
+    .filter((name) => name < '0008'))
+    sqlite.exec(readFileSync(new URL(name, migrations), 'utf8'));
+  sqlite.exec(`INSERT INTO kb_domains(project,name) VALUES ('default','legacy');
+    INSERT INTO kb_files(id,project,domain,filename,mime,bytes,content_hash,object_key)
+    VALUES ('old','default','legacy','old','text/plain',5,'same','raw/shared');
+    INSERT INTO kb_ingest_jobs(id,project,domain,file_id,status) VALUES ('job','default','legacy','old','queued');`);
+  const report = inventoryLegacyOwnership(sqlite, 'default');
+  expect(report).toMatchObject({ ownershipSchema: false, readyForBackfill: false });
+  expect(report.files[0]).toMatchObject({ unresolvedJobs: 1, disposition: 'blocked', reasons: ['unsettled-writers', 'ownership-schema-absent'] });
+  expect(sqlite.prepare("SELECT name FROM sqlite_master WHERE name='kb_file_lifecycle'").get()).toBeUndefined();
+  sqlite.exec("UPDATE kb_ingest_jobs SET status='succeeded'");
+  expect(inventoryLegacyOwnership(sqlite, 'default').files[0].unresolvedJobs).toBe(0);
+  sqlite.exec("UPDATE kb_ingest_jobs SET locked_by='unsettled-worker'");
+  expect(inventoryLegacyOwnership(sqlite, 'default').files[0].unresolvedJobs).toBe(1);
 });
