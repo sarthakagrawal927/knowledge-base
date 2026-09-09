@@ -27,4 +27,24 @@ jobs:
       - run: pnpm --dir app install --frozen-lockfile
       - run: pnpm --dir cloudflare/worker install --frozen-lockfile
       - run: pnpm --dir landing-astro install --frozen-lockfile
-      - run: pnpm quality
+      - run: pnpm quality:format
+      - run: pnpm docs:check
+      - run: pnpm check
+        working-directory: app
+      - run: pnpm build
+        working-directory: app
+      - run: pnpm test:coverage
+        working-directory: app
+      - run: pnpm typecheck
+        working-directory: cloudflare/worker
+      - run: pnpm test:coverage
+        working-directory: cloudflare/worker
+      - run: pnpm check
+        working-directory: landing-astro
+      - run: pnpm quality:unused
+      - run: pnpm quality:complexity
+      - run: pnpm quality:duplication
+      - run: pnpm quality:dependencies
+      - run: pnpm quality:cycles
+      - run: pnpm quality:suppressions
+      - run: pnpm quality:hygiene
