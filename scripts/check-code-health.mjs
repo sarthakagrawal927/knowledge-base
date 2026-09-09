@@ -163,24 +163,14 @@ function checkDependencies() {
       'GHSA-5p4m-2wfm-xmqj',
       'GHSA-7p8r-x3mc-p8w7',
       'GHSA-8hv8-536x-4wqp',
-      'GHSA-f88m-g3jw-g9cj',
       'GHSA-mh99-v99m-4gvg',
       'GHSA-mwp4-54f8-5fhr',
       'GHSA-rgw5-rvv9-x895',
       'GHSA-v2hh-gcrm-f6hx',
     ]),
-    app: new Set([
-      'GHSA-2v37-7h3g-55p8',
-      'GHSA-3jxr-9vmj-r5cp',
-      'GHSA-4cwx-7wf7-3272',
-      'GHSA-52cp-r559-cp3m',
-      'GHSA-5p4m-2wfm-xmqj',
-      'GHSA-f88m-g3jw-g9cj',
-      'GHSA-mh99-v99m-4gvg',
-      'GHSA-rgw5-rvv9-x895',
-    ]),
-    worker: new Set(['GHSA-28wg-ghj8-5hjv', 'GHSA-2v37-7h3g-55p8', 'GHSA-4cwx-7wf7-3272', 'GHSA-f88m-g3jw-g9cj', 'GHSA-r28c-9q8g-f849']),
-    landing: new Set(['GHSA-2v37-7h3g-55p8', 'GHSA-5p4m-2wfm-xmqj', 'GHSA-7p8r-x3mc-p8w7']),
+    app: new Set(['GHSA-2v37-7h3g-55p8', 'GHSA-3jxr-9vmj-r5cp', 'GHSA-4cwx-7wf7-3272', 'GHSA-mh99-v99m-4gvg', 'GHSA-rgw5-rvv9-x895']),
+    worker: new Set(['GHSA-28wg-ghj8-5hjv', 'GHSA-2v37-7h3g-55p8', 'GHSA-4cwx-7wf7-3272', 'GHSA-r28c-9q8g-f849']),
+    landing: new Set(['GHSA-2v37-7h3g-55p8', 'GHSA-7p8r-x3mc-p8w7']),
   };
   for (const [scope, report] of Object.entries(reports)) {
     const unexpected = report.ids.filter((id) => !acceptedIds[scope].has(id));
@@ -201,13 +191,13 @@ function checkDependencies() {
   // Debt: https://github.com/sass-maker/knowledge-base/issues/33
   const baseline = {
     rootCritical: 0,
-    rootHigh: 14,
+    rootHigh: 0,
     appCritical: 0,
-    appHigh: 11,
+    appHigh: 8,
     workerCritical: 0,
-    workerHigh: 5,
+    workerHigh: 4,
     landingCritical: 0,
-    landingHigh: 2,
+    landingHigh: 1,
   };
   console.log(
     `Dependencies: 0 critical; high advisories root ${observed.rootHigh}, app ${observed.appHigh}, ` +

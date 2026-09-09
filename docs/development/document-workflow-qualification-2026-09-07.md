@@ -238,3 +238,24 @@ The PDF test disables network fetch. Worker dry-run output was 1797.89 KiB
 Format, docs, unused, complexity, duplication, cycles, suppressions and diff
 hygiene passed. The core-only dependency gate identified pre-existing advisories; a separately
 reviewed dependency repair follows. No production action occurred.
+
+
+### Dependency gate follow-up (2026-09-09)
+
+The separate maintenance change updates existing root Sharp and scoped
+Wrangler/Miniflare Sharp to 0.35.4, ESLint's js-yaml to 4.3.2, and the static
+landing's Astro 7.1.6 to 7.2.8 with Sharp 0.35.4, js-yaml 4.3.2 and SVGO 4.1.0.
+No provider configuration, runtime product dependency or landing source changed.
+Resolved exceptions were removed and high-advisory ceilings lowered; remaining
+accepted debt is root 0, dashboard 8, Worker 4 and landing 1 (zero critical).
+
+Full `pnpm quality` passes on Node 24.20.0: 411 Worker tests, 6 dashboard tests,
+dashboard/landing builds and all maintenance gates. Twelve real Sharp
+encode/decode checks cover PNG, lossless WebP and JPEG across all four resolved
+package paths, including exact lossless pixel equality. At 390px and 1440px,
+landing visible text, 55 links and viewport fit match the pre-update build (local
+server ports normalized inside AI prompt links). Screenshot differences are
+confined to the existing animated footer strip; no spacing configuration change
+was needed. The [machine-readable local receipt](dependency-repair-2026-09-09.json)
+records these checks. This does not qualify hosted owner ingestion, migration,
+backfill or activation; issue 48 remains open.

@@ -1,0 +1,170 @@
+{
+  "node": "24.20.0",
+  "coreCommit": "5263f6e",
+  "quality": "passed",
+  "workerTests": 411,
+  "dashboardTests": 6,
+  "dependencyAudit": {
+    "critical": 0,
+    "acceptedHigh": {
+      "root": 0,
+      "app": 8,
+      "worker": 4,
+      "landing": 1
+    }
+  },
+  "sharp": [
+    {
+      "scope": "root",
+      "sharp": "0.35.4",
+      "format": "png",
+      "bytes": 93,
+      "width": 12,
+      "height": 8,
+      "losslessPixels": true
+    },
+    {
+      "scope": "root",
+      "sharp": "0.35.4",
+      "format": "webp",
+      "bytes": 38,
+      "width": 12,
+      "height": 8,
+      "losslessPixels": true
+    },
+    {
+      "scope": "root",
+      "sharp": "0.35.4",
+      "format": "jpeg",
+      "bytes": 267,
+      "width": 12,
+      "height": 8,
+      "losslessPixels": null
+    },
+    {
+      "scope": "app",
+      "sharp": "0.35.4",
+      "format": "png",
+      "bytes": 93,
+      "width": 12,
+      "height": 8,
+      "losslessPixels": true
+    },
+    {
+      "scope": "app",
+      "sharp": "0.35.4",
+      "format": "webp",
+      "bytes": 38,
+      "width": 12,
+      "height": 8,
+      "losslessPixels": true
+    },
+    {
+      "scope": "app",
+      "sharp": "0.35.4",
+      "format": "jpeg",
+      "bytes": 267,
+      "width": 12,
+      "height": 8,
+      "losslessPixels": null
+    },
+    {
+      "scope": "cloudflare/worker",
+      "sharp": "0.35.4",
+      "format": "png",
+      "bytes": 93,
+      "width": 12,
+      "height": 8,
+      "losslessPixels": true
+    },
+    {
+      "scope": "cloudflare/worker",
+      "sharp": "0.35.4",
+      "format": "webp",
+      "bytes": 38,
+      "width": 12,
+      "height": 8,
+      "losslessPixels": true
+    },
+    {
+      "scope": "cloudflare/worker",
+      "sharp": "0.35.4",
+      "format": "jpeg",
+      "bytes": 267,
+      "width": 12,
+      "height": 8,
+      "losslessPixels": null
+    },
+    {
+      "scope": "landing",
+      "sharp": "0.35.4",
+      "format": "png",
+      "bytes": 93,
+      "width": 12,
+      "height": 8,
+      "losslessPixels": true
+    },
+    {
+      "scope": "landing",
+      "sharp": "0.35.4",
+      "format": "webp",
+      "bytes": 38,
+      "width": 12,
+      "height": 8,
+      "losslessPixels": true
+    },
+    {
+      "scope": "landing",
+      "sharp": "0.35.4",
+      "format": "jpeg",
+      "bytes": 267,
+      "width": 12,
+      "height": 8,
+      "losslessPixels": null
+    }
+  ],
+  "landing": [
+    {
+      "width": 390,
+      "textMatches": true,
+      "linksMatchExceptEphemeralLocalPort": true,
+      "linkCount": 55,
+      "overflow": false,
+      "pixelsMatch": false,
+      "dimensionsMatch": true,
+      "changedPixels": 2691,
+      "changedPercent": 0.15653357531760437,
+      "changedBounds": {
+        "minX": 14,
+        "minY": 4381,
+        "maxX": 375,
+        "maxY": 4391
+      }
+    },
+    {
+      "width": 1440,
+      "textMatches": true,
+      "linksMatchExceptEphemeralLocalPort": true,
+      "linkCount": 55,
+      "overflow": false,
+      "pixelsMatch": false,
+      "dimensionsMatch": true,
+      "changedPixels": 6262,
+      "changedPercent": 0.11251257726031336,
+      "changedBounds": {
+        "minX": 534,
+        "minY": 3806,
+        "maxX": 1423,
+        "maxY": 3818
+      }
+    }
+  ],
+  "screenshotSha256": {
+    "after-1440.png": "fce15e11a850b098613315d4e60aef183d293c3ff81981146c2e03c38a4dc812",
+    "after-390.png": "9c92349e899df92b83ccae45b0c5ae578c6cca862bfa180109319cb8daccce98",
+    "before-1440.png": "34cc96003bbb5e4dcc15561e28911e1af694d44b3757f821330c0c263bae5f1f",
+    "before-390.png": "8d5f7625c5100c66ba5a20afded6336e9d3002641b9fdb131a22f8aeaa3b1fec"
+  },
+  "productionActions": false,
+  "publicationReady": false
+}

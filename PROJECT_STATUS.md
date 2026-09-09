@@ -147,3 +147,10 @@ unchanged. This is preparation only: every manifest keeps publication false;
 ledger reservation, indexed/structured backfill, unsettled-write recovery,
 production migration/activation and owner-account acceptance remain unqualified.
 See the [canonical workflow receipt](docs/development/document-workflow-qualification-2026-09-07.md#offline-parse-provenance-reconstruction-2026-09-09-source-candidate).
+
+
+The separate dependency follow-up restores the full local quality gate without
+expanding advisory exceptions. Existing build/development dependencies were
+patched and landing desktop/mobile text, links and layout retained. This does
+not change issue 48's production/backfill/owner-account gates. See the
+[dependency validation receipt](docs/development/document-workflow-qualification-2026-09-07.md#dependency-gate-follow-up-2026-09-09).
