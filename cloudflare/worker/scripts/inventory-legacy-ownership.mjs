@@ -45,6 +45,8 @@ function inspectFile(db, file, ownershipSchema) {
     project: file.project,
     fileId: file.id,
     domain: file.domain,
+    filename: file.filename,
+    mime: file.mime,
     contentHash: file.content_hash,
     recordedBytes: file.bytes,
     sourceRawKey: file.object_key,
@@ -71,7 +73,7 @@ export function inventoryLegacyOwnership(db, project) {
     const ownershipSchema = hasTable('kb_file_lifecycle') && hasTable('kb_file_operations');
     if (hasTable('kb_file_lifecycle') !== hasTable('kb_file_operations')) throw new Error('Incomplete ownership schema');
     const files = db
-      .prepare('SELECT id,project,domain,content_hash,bytes,object_key FROM kb_files WHERE project=? ORDER BY domain,id')
+      .prepare('SELECT id,project,domain,filename,mime,content_hash,bytes,object_key FROM kb_files WHERE project=? ORDER BY domain,id')
       .all(project)
       .map((file) => inspectFile(db, file, ownershipSchema));
     const orphanLifecycleCount = ownershipSchema

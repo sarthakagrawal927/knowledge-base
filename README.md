@@ -348,3 +348,9 @@ For agent frameworks, use the checked-in
 [OpenAI Agents SDK and LangChain.js examples](docs/product/agent-integration-examples.md).
 Both preserve the complete citation payload returned by the typed client
 contract.
+
+
+The offline parse staging candidate reconstructs per-file provenance from verified
+raw exports and a read-only snapshot, including PDF page/excerpt attribution.
+It cannot publish or activate owned artifacts. See the
+[workflow qualification and remaining issue 48 gates](docs/development/document-workflow-qualification-2026-09-07.md#offline-parse-provenance-reconstruction-2026-09-09-source-candidate).

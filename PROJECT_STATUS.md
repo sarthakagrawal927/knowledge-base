@@ -134,3 +134,16 @@ line and move the old snapshot into the archive.
 Open work is tracked only in [GitHub Issues](https://github.com/sass-maker/knowledge-base/issues).
 An open issue is a to-do, a linked pull request is in progress, and merge plus
 issue closure makes the work done.
+
+
+## 2026-09-09 — offline parse provenance source candidate
+
+Issue 48 gains a provider-free parse staging command over verified raw exports
+and a read-only SQLite snapshot. Existing local format parsers are reused;
+offline-only PDF.js provides page-tree ordered text and page/excerpt provenance.
+Artifacts are deterministic per owner/file, retries verify immutable bytes, and
+unsupported/OCR/password cases remain blocked. The hosted Worker parser is
+unchanged. This is preparation only: every manifest keeps publication false;
+ledger reservation, indexed/structured backfill, unsettled-write recovery,
+production migration/activation and owner-account acceptance remain unqualified.
+See the [canonical workflow receipt](docs/development/document-workflow-qualification-2026-09-07.md#offline-parse-provenance-reconstruction-2026-09-09-source-candidate).

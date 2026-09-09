@@ -1,3 +1,4 @@
+import { buildParseArtifact } from './parse-artifact';
 import { parseCacheOptions, TtlCache } from './cache';
 import { chunkText } from './chunk';
 import { D1Repository } from './d1-repository';
@@ -1030,30 +1031,10 @@ export function createRuntime(options: AppOptions = {}) {
           file.filename,
         );
         if (parsed.documents.length === 0 || !parsed.text) throw new Error(`file has no parseable text content via ${parsed.parser}`);
-        const docs = parsed.documents.map((doc) => ({
-          ...doc,
-          metadata: {
-            ...doc.metadata,
-            project: tenant,
-            domain,
-            file_id: file.id,
-            filename: file.filename,
-          },
-        }));
+        const parseArtifact = buildParseArtifact(parsed, { project: tenant, domain, id: file.id, filename: file.filename, content_hash: file.content_hash });
+        const docs = parseArtifact.documents;
         const artifactKey = parseArtifactKey(domain, file.content_hash);
-        const parseContent = JSON.stringify({
-          parser: parsed.parser,
-          parser_version: parsed.parser_version,
-          project: tenant,
-          domain,
-          file_id: file.id,
-          filename: file.filename,
-          content_hash: file.content_hash,
-          record_count: parsed.record_count,
-          document_count: docs.length,
-          text_length: parsed.text.length,
-          documents: docs,
-        });
+        const parseContent = JSON.stringify(parseArtifact);
         const parseOptions = {
           httpMetadata: { contentType: 'application/json' },
           customMetadata: {

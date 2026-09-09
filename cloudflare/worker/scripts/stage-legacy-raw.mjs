@@ -1,25 +1,8 @@
 #!/usr/bin/env node
-import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, constants, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { isAbsolute, join, resolve } from 'node:path';
 import { inventorySnapshot } from './inventory-legacy-ownership.mjs';
-
-const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
-function inside(root, path) {
-  const rel = relative(root, path);
-  return rel !== '' && rel !== '..' && !rel.startsWith('../') && !isAbsolute(rel);
-}
-
-function readRegular(path) {
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    if (!fstatSync(fd).isFile()) throw new Error('Expected a regular file');
-    return readFileSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-}
+import { hash, inside, readRegular, immutableWrite, stagingDirectory, runStagingCli } from './lib/offline-stage-files.mjs';
 
 function verifiedSource(root, file) {
   if (!/^[a-f0-9]{64}$/.test(file.contentHash) || !Number.isSafeInteger(file.recordedBytes) || file.recordedBytes < 0)
@@ -31,35 +14,6 @@ function verifiedSource(root, file) {
   const bytes = readRegular(path);
   if (bytes.byteLength !== file.recordedBytes || hash(bytes) !== file.contentHash) throw new Error('Source hash or size mismatch');
   return bytes;
-}
-
-function immutableWrite(path, bytes) {
-  const temporary = join(dirname(path), `.stage-${randomUUID()}`);
-  writeFileSync(temporary, bytes, { flag: 'wx', mode: 0o600 });
-  try {
-    try {
-      linkSync(temporary, path);
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      if (!readRegular(path).equals(bytes)) throw new Error('Existing staging output conflicts with verified input');
-    }
-    if (!readRegular(path).equals(bytes)) throw new Error('Staging readback verification failed');
-  } finally {
-    unlinkSync(temporary);
-  }
-}
-
-function stagingDirectory(sourceRoot, requestedOutput) {
-  const parent = realpathSync(dirname(resolve(requestedOutput)));
-  const output = join(parent, basename(resolve(requestedOutput)));
-  if (output === sourceRoot || inside(sourceRoot, output) || inside(output, sourceRoot)) throw new Error('Source and staging directories must not overlap');
-  try {
-    mkdirSync(output, { mode: 0o700 });
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error;
-  }
-  if (!lstatSync(output).isDirectory() || lstatSync(output).isSymbolicLink()) throw new Error('Staging destination must be a real directory');
-  return output;
 }
 
 export function stageLegacyRaw(databasePath, project, objectRoot, outputRoot) {
@@ -81,6 +35,8 @@ export function stageLegacyRaw(databasePath, project, objectRoot, outputRoot) {
       project: file.project,
       fileId: file.fileId,
       domain: file.domain,
+      filename: file.filename,
+      mime: file.mime,
       sourceRawKey: file.sourceRawKey,
       ownedRawKey: file.proposedOwnedRawKey,
       stagedFile,
@@ -89,7 +45,7 @@ export function stageLegacyRaw(databasePath, project, objectRoot, outputRoot) {
     };
   });
   const manifest = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     mode: 'verified-offline-raw-stage',
     project,
     readyForPublication: false,
@@ -104,14 +60,4 @@ export function stageLegacyRaw(databasePath, project, objectRoot, outputRoot) {
   return manifest;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  try {
-    const args = process.argv.slice(2);
-    if (args.length !== 8 || args[0] !== '--database' || args[2] !== '--project' || args[4] !== '--object-root' || args[6] !== '--output-root')
-      throw new Error('Usage: node scripts/stage-legacy-raw.mjs --database SNAPSHOT --project PROJECT --object-root EXPORT --output-root STAGING');
-    console.log(JSON.stringify(stageLegacyRaw(args[1], args[3], args[5], args[7]), null, 2));
-  } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
-  }
-}
+await runStagingCli(import.meta.url, ['--database', '--project', '--object-root', '--output-root'], stageLegacyRaw);
