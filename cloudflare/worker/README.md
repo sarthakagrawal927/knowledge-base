@@ -252,6 +252,7 @@ public health/readiness/metrics probes.
 - `POST /v1/kb/files`
 - `GET /v1/kb/files/:file_id`
 - `POST /v1/kb/files/:file_id/reprocess`
+- `POST /v1/kb/files/:file_id/operations/:operation_id/cancel-prepared` — authenticated owner-only recovery, behind the internal ownership activation gate; requires source migration 0010 and the exact reservation operation ID. It cancels only never-dispatched work, never publishes or deletes a file. See the [recovery contract](../../docs/development/document-workflow-qualification-2026-09-07.md#never-dispatched-operation-recovery-2026-09-09-source-candidate).
 - `DELETE /v1/kb/files/:file_id`
 - `POST /v1/kb/files/upload`
 - `GET /v1/kb/chunks`

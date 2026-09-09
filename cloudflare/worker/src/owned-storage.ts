@@ -36,6 +36,7 @@ export async function storeFileBytes(
     await ledger.settle(operation, false);
     throw new HTTPException(409, { message: 'File deletion is pending.' });
   }
+  if (!(await ledger.startWrite(operation, artifactId))) throw new HTTPException(409, { message: 'File operation was cancelled before dispatch.' });
   // A rejected/uncertain external write deliberately leaves the operation running.
   // Recovery must establish settlement; a timer is not evidence of termination.
   try {
@@ -87,6 +88,7 @@ export async function persistParseArtifact(
   const key = ownedParseKey(operation);
   if (!(await ledger.recordIntent(operation, { artifact_id: artifactId, kind: 'parse', resource_id: key, provider: 'r2' })))
     throw new HTTPException(409, { message: 'File deletion is pending.' });
+  if (!(await ledger.startWrite(operation, artifactId))) throw new HTTPException(409, { message: 'File operation was cancelled before dispatch.' });
   try {
     await env.RAW_DOCS.put(key, content, options);
   } catch {

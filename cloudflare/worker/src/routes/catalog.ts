@@ -573,6 +573,22 @@ export function registerCatalogRoutes(app: App, rt: AppRuntime): void {
     return c.json({ project: tenant, file_id: file.id, job });
   });
 
+  app.post('/v1/kb/files/:file_id/operations/:operation_id/cancel-prepared', async (c) => {
+    const result = await rt.recoverPreparedOperation(c.env, c.get('tenant'), c.req.param('file_id'), c.req.param('operation_id'));
+    if (!result) return c.json({ error: 'operation not found' }, 404);
+    if (result === 'blocked')
+      return c.json({ error: 'operation recovery blocked', message: 'Write dispatch may have started. This recovery path cannot establish settlement.' }, 409);
+    return c.json({
+      project: c.get('tenant'),
+      file_id: c.req.param('file_id'),
+      operation_id: c.req.param('operation_id'),
+      state: 'cancelled',
+      publication_changed: false,
+      file_deleted: false,
+      message: 'Operation cancelled before artifact dispatch. Retry reprocessing, or delete an incomplete upload before uploading again.',
+    });
+  });
+
   app.delete('/v1/kb/files/:file_id', async (c) => {
     const tenant = c.get('tenant');
     const repo = makeMetadataRepository(c.env);

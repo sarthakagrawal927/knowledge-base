@@ -34,6 +34,7 @@ export interface FileArtifact {
   resource_id: string;
   provider: string;
   write_state: 'intent' | 'accepted' | 'confirmed';
+  dispatch_state: 'unknown' | 'prepared' | 'started';
   cleanup_state: 'pending' | 'confirmed';
   mutation_receipt: string | null;
 }
@@ -109,14 +110,65 @@ export class D1FileOwnership {
   async recordIntent(operation: FileOperation, artifact: Pick<FileArtifact, 'artifact_id' | 'kind' | 'resource_id' | 'provider'>): Promise<boolean> {
     const result = await this.db
       .prepare(`INSERT INTO kb_file_artifacts
-      (artifact_id, project, file_id, generation, operation_id, kind, resource_id, provider)
-      SELECT ?, o.project, o.file_id, o.generation, o.operation_id, ?, ?, ?
+      (artifact_id, project, file_id, generation, operation_id, kind, resource_id, provider, dispatch_state)
+      SELECT ?, o.project, o.file_id, o.generation, o.operation_id, ?, ?, ?, 'prepared'
       FROM kb_file_operations o JOIN kb_file_lifecycle l ON l.project = o.project AND l.file_id = o.file_id
       WHERE o.project = ? AND o.operation_id = ? AND o.state = 'running'
       AND l.state IN ('uploading', 'active') AND l.generation = o.generation AND l.active_operation_id = o.operation_id`)
       .bind(artifact.artifact_id, artifact.kind, artifact.resource_id, artifact.provider, operation.project, operation.operation_id)
       .run();
     return result.meta.changes === 1;
+  }
+
+  // This transition must commit before the producer can issue its write.
+  // A prepared cancellation and dispatch compete on the same durable ledger.
+  async startWrite(operation: FileOperation, artifactId: string): Promise<boolean> {
+    const result = await this.db
+      .prepare(`UPDATE kb_file_artifacts SET dispatch_state = 'started'
+      WHERE project = ? AND file_id = ? AND operation_id = ? AND generation = ? AND artifact_id = ?
+      AND dispatch_state = 'prepared' AND write_state = 'intent' AND cleanup_state = 'pending'
+      AND EXISTS (SELECT 1 FROM kb_file_operations o JOIN kb_file_lifecycle l
+        ON l.project = o.project AND l.file_id = o.file_id
+        WHERE o.operation_id = kb_file_artifacts.operation_id AND o.state = 'running'
+        AND l.state IN ('uploading','active') AND l.generation = o.generation AND l.active_operation_id = o.operation_id)`)
+      .bind(operation.project, operation.file_id, operation.operation_id, operation.generation, artifactId)
+      .run();
+    return result.meta.changes === 1;
+  }
+
+  // No timer or external absence check is settlement evidence. This fast path
+  // covers only operations for which no artifact write could have started.
+  async cancelPrepared(project: string, operationId: string): Promise<boolean> {
+    await this.db.batch([
+      this.db
+        .prepare(`UPDATE kb_file_operations SET state = 'settled', settled_at = datetime('now')
+        WHERE project = ? AND operation_id = ? AND state = 'running'
+        AND NOT EXISTS (SELECT 1 FROM kb_file_artifacts a WHERE a.project = ? AND a.operation_id = ?
+          AND (a.dispatch_state != 'prepared' OR a.write_state != 'intent'))`)
+        .bind(project, operationId, project, operationId),
+      this.db
+        .prepare(`UPDATE kb_file_artifacts SET cleanup_state = 'confirmed'
+        WHERE project = ? AND operation_id = ? AND dispatch_state = 'prepared' AND write_state = 'intent'
+        AND EXISTS (SELECT 1 FROM kb_file_operations o WHERE o.project = ? AND o.operation_id = ? AND o.state = 'settled')
+        AND NOT EXISTS (SELECT 1 FROM kb_file_artifacts a WHERE a.project = ? AND a.operation_id = ?
+          AND (a.dispatch_state != 'prepared' OR a.write_state != 'intent'))`)
+        .bind(project, operationId, project, operationId, project, operationId),
+      this.db
+        .prepare(`UPDATE kb_file_lifecycle SET active_operation_id = NULL, updated_at = datetime('now')
+        WHERE project = ? AND active_operation_id = ?
+        AND EXISTS (SELECT 1 FROM kb_file_operations o WHERE o.project = ? AND o.operation_id = ? AND o.state = 'settled')
+        AND NOT EXISTS (SELECT 1 FROM kb_file_artifacts a WHERE a.project = ? AND a.operation_id = ?
+          AND (a.dispatch_state != 'prepared' OR a.write_state != 'intent'))`)
+        .bind(project, operationId, project, operationId, project, operationId),
+    ]);
+    return Boolean(
+      await this.db
+        .prepare(`SELECT 1 FROM kb_file_operations o WHERE o.project = ? AND o.operation_id = ? AND o.state = 'settled'
+      AND NOT EXISTS (SELECT 1 FROM kb_file_artifacts a WHERE a.project = o.project AND a.operation_id = o.operation_id
+        AND (a.dispatch_state != 'prepared' OR a.write_state != 'intent' OR a.cleanup_state != 'confirmed'))`)
+        .bind(project, operationId)
+        .first(),
+    );
   }
 
   async recordWrite(
@@ -128,7 +180,7 @@ export class D1FileOwnership {
   ): Promise<boolean> {
     const result = await this.db
       .prepare(`UPDATE kb_file_artifacts SET write_state = ?, mutation_receipt = ?
-      WHERE project = ? AND operation_id = ? AND artifact_id = ? AND cleanup_state = 'pending'
+      WHERE project = ? AND operation_id = ? AND artifact_id = ? AND cleanup_state = 'pending' AND dispatch_state != 'prepared'
       AND EXISTS (SELECT 1 FROM kb_file_operations o WHERE o.operation_id = kb_file_artifacts.operation_id AND o.state = 'running')`)
       .bind(state, receipt, project, operationId, artifactId)
       .run();

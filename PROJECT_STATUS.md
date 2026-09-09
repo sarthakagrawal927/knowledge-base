@@ -154,3 +154,15 @@ expanding advisory exceptions. Existing build/development dependencies were
 patched and landing desktop/mobile text, links and layout retained. This does
 not change issue 48's production/backfill/owner-account gates. See the
 [dependency validation receipt](docs/development/document-workflow-qualification-2026-09-07.md#dependency-gate-follow-up-2026-09-09).
+
+
+## 2026-09-09 — never-dispatched recovery source candidate
+
+The owned-file ledger can safely cancel an operation only while every artifact
+write remains prepared (or no intent exists). Every supported owned producer
+must durably win dispatch first. Cancellation and dispatch serialize through
+D1/SQLite; unknown legacy or started/accepted/confirmed writes remain pending.
+This requires additive source migration 0010, tested only on synthetic SQLite.
+An authenticated tenant-scoped recovery route remains behind the existing
+internal ownership activation gate. No automatic recovery, migration deployment
+or production activation is included. See the [recovery contract](docs/development/document-workflow-qualification-2026-09-07.md#never-dispatched-operation-recovery-2026-09-09-source-candidate).

@@ -145,6 +145,14 @@ export function createRuntime(options: AppOptions = {}) {
       ),
     ]);
   }
+  const recoverPreparedOperation = async (env: Env, tenant: string, fileId: string, operationId: string): Promise<'cancelled' | 'blocked' | null> => {
+    if (!options.ownedFileProtocol) return null;
+    const ledger = new D1FileOwnership(env.DB);
+    const operation = await ledger.operation(tenant, operationId);
+    if (!operation || operation.file_id !== fileId) return null;
+    return (await ledger.cancelPrepared(tenant, operationId)) ? 'cancelled' : 'blocked';
+  };
+
   const ownedDeletion = (env: Env, tenant: string, fileId: string) =>
     options.ownedFileProtocol ? deleteOwnedFile(env, tenant, fileId, configuredVectorizeProfiles(env)) : Promise.resolve(null);
 
@@ -859,6 +867,7 @@ export function createRuntime(options: AppOptions = {}) {
         const artifactId = crypto.randomUUID();
         if (!(await ledger.recordIntent(operation, { artifact_id: artifactId, kind: 'vector', resource_id: row.id, provider: `vector:${profile.key}` })))
           throw new HTTPException(409, { message: 'File deletion is pending.' });
+        if (!(await ledger.startWrite(operation, artifactId))) throw new HTTPException(409, { message: 'File operation was cancelled before dispatch.' });
         intents.push({ artifactId, rowId: row.id });
       }
     }
@@ -916,6 +925,8 @@ export function createRuntime(options: AppOptions = {}) {
         !(await ledger.recordIntent(operation, { artifact_id: artifactId, kind: 'document', resource_id: documentId, provider: 'd1' }))
       )
         throw new HTTPException(409, { message: 'File deletion is pending.' });
+      if (operation && ledger && !(await ledger.startWrite(operation, artifactId)))
+        throw new HTTPException(409, { message: 'File operation was cancelled before dispatch.' });
       const existingDocument = await repo.getDocument(tenant, documentId);
       const document =
         existingDocument ??
@@ -1621,6 +1632,7 @@ export function createRuntime(options: AppOptions = {}) {
     completeOwnedOperation,
     abortOwnedOperation,
     ownedDeletion,
+    recoverPreparedOperation,
     listDeletionFiles,
     ownedParseLookup,
     genericOwnershipConflict,

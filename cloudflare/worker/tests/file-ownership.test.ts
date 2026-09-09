@@ -20,13 +20,14 @@ afterEach(() => {
   for (const db of databases.splice(0)) db.close();
 });
 
-function fixture(beforeOwnership?: (sqlite: DatabaseSync) => void) {
+function fixture(beforeOwnership?: (sqlite: DatabaseSync) => void, beforeDispatchMigration?: (sqlite: DatabaseSync) => void) {
   const sqlite = new DatabaseSync(':memory:');
   databases.push(sqlite);
   sqlite.exec('PRAGMA foreign_keys = ON');
   const migrations = new URL('../migrations/', import.meta.url);
   for (const name of readdirSync(migrations).sort()) {
     if (name.startsWith('0008')) beforeOwnership?.(sqlite);
+    if (name.startsWith('0010')) beforeDispatchMigration?.(sqlite);
     sqlite.exec(readFileSync(new URL(name, migrations), 'utf8'));
   }
   sqlite.exec(`INSERT OR IGNORE INTO kb_projects(name) VALUES ('tenant-a'), ('tenant-b');
@@ -74,6 +75,7 @@ async function uploaded(ledger: D1FileOwnership, id = 'a', project = 'tenant-a',
   expect(await ledger.recordIntent(op, { artifact_id: `raw-${id}`, kind: 'raw', resource_id: ownedRawKey(project, id, 'same-hash'), provider: 'r2' })).toBe(
     true,
   );
+  expect(await ledger.startWrite(op, `raw-${id}`)).toBe(true);
   expect(await ledger.recordWrite(project, op.operation_id, `raw-${id}`, 'confirmed')).toBe(true);
   expect(await ledger.settle(op, true)).toBe(true);
   return op;
@@ -193,6 +195,7 @@ describe('inactive owned-file protocol with real migrated SQLite', () => {
     const writer = (await ledger.claim('tenant-a', 'a', 'parse-a', 'ingest')) as FileOperation;
     const key = ownedParseKey(writer);
     expect(await ledger.recordIntent(writer, { artifact_id: 'parse-a', kind: 'parse', resource_id: key, provider: 'r2' })).toBe(true);
+    expect(await ledger.startWrite(writer, 'parse-a')).toBe(true);
     const objects = new Map<string, string>();
     let finishPut: (() => void) | undefined;
     const put = new Promise<void>((resolve) => {
@@ -227,6 +230,7 @@ describe('inactive owned-file protocol with real migrated SQLite', () => {
     await uploaded(ledger);
     const op = (await ledger.claim('tenant-a', 'a', 'index-a', 'ingest')) as FileOperation;
     await ledger.recordIntent(op, { artifact_id: 'vector-a', kind: 'vector', resource_id: 'vec-a', provider: 'vector-base' });
+    expect(await ledger.startWrite(op, 'vector-a')).toBe(true);
     await ledger.recordWrite('tenant-a', op.operation_id, 'vector-a', 'accepted', 'mutation-upsert');
     await ledger.settle(op, true);
     await ledger.requestDelete('tenant-a', 'a', 'delete-a');
@@ -832,4 +836,181 @@ it('reports pre-ownership schema and queued legacy jobs without creating a ledge
   expect(inventoryLegacyOwnership(sqlite, 'default').files[0].unresolvedJobs).toBe(0);
   sqlite.exec("UPDATE kb_ingest_jobs SET locked_by='unsettled-worker'");
   expect(inventoryLegacyOwnership(sqlite, 'default').files[0].unresolvedJobs).toBe(1);
+});
+
+describe('never-dispatched recovery', () => {
+  it('serializes cancellation before dispatch and blocks later intents including empty reservations', async () => {
+    const { ledger, db } = fixture();
+    await ledger.reserve(input('prepared'), 'op-prepared');
+    const operation = (await ledger.operation('tenant-a', 'op-prepared'))!;
+    await ledger.recordIntent(operation, { artifact_id: 'prepared-raw', kind: 'raw', resource_id: 'owned/prepared', provider: 'r2' });
+    expect(await ledger.cancelPrepared('tenant-b', 'op-prepared')).toBe(false);
+    expect(await ledger.cancelPrepared('tenant-a', 'op-prepared')).toBe(true);
+    expect(await ledger.startWrite(operation, 'prepared-raw')).toBe(false);
+    expect(await ledger.recordIntent(operation, { artifact_id: 'late', kind: 'parse', resource_id: 'owned/late', provider: 'r2' })).toBe(false);
+    expect(await ledger.cancelPrepared('tenant-a', 'op-prepared')).toBe(true);
+    expect(await new D1FileOwnership(db).cancelPrepared('tenant-a', 'op-prepared')).toBe(true);
+    await ledger.requestDelete('tenant-a', 'prepared', 'delete');
+    expect(await ledger.finishDelete('tenant-a', 'prepared')).toBe(true);
+    await ledger.reserve(input('empty', 'tenant-b'), 'op-empty');
+    const empty = (await ledger.operation('tenant-b', 'op-empty'))!;
+    expect(await ledger.cancelPrepared('tenant-b', 'op-empty')).toBe(true);
+    expect(await ledger.recordIntent(empty, { artifact_id: 'late-empty', kind: 'raw', resource_id: 'owned/empty', provider: 'r2' })).toBe(false);
+  });
+  it.each(['unknown', 'started', 'accepted', 'confirmed'])('refuses recovery after %s evidence without relying on age', async (state) => {
+    const { ledger, sqlite } = fixture();
+    await ledger.reserve(input('uncertain'), 'op-uncertain');
+    const operation = (await ledger.operation('tenant-a', 'op-uncertain'))!;
+    await ledger.recordIntent(operation, { artifact_id: 'uncertain', kind: 'raw', resource_id: 'owned/uncertain', provider: 'r2' });
+    if (state === 'unknown') sqlite.exec("UPDATE kb_file_artifacts SET dispatch_state='unknown'");
+    else {
+      expect(await ledger.startWrite(operation, 'uncertain')).toBe(true);
+      if (state !== 'started') expect(await ledger.recordWrite('tenant-a', 'op-uncertain', 'uncertain', state as 'accepted' | 'confirmed')).toBe(true);
+    }
+    sqlite.exec("UPDATE kb_file_operations SET created_at='2000-01-01'");
+    expect(await ledger.cancelPrepared('tenant-a', 'op-uncertain')).toBe(false);
+    expect((await ledger.operation('tenant-a', 'op-uncertain'))?.state).toBe('running');
+    await ledger.requestDelete('tenant-a', 'uncertain', 'delete');
+    expect(await ledger.finishDelete('tenant-a', 'uncertain')).toBe(false);
+  });
+  it('prevents an actual upload handler from writing after prepared cancellation wins', async () => {
+    const f = handlerFixture();
+    const prepare = f.db.prepare.bind(f.db);
+    let intercepted = false;
+    f.db.prepare = ((sql: string) => {
+      const statement = prepare(sql);
+      if (!sql.includes("SET dispatch_state = 'started'")) return statement;
+      const bind = statement.bind.bind(statement);
+      statement.bind = ((...values: unknown[]) => {
+        const bound = bind(...values);
+        const run = bound.run.bind(bound);
+        bound.run = (async () => {
+          if (!intercepted) {
+            intercepted = true;
+            const row = f.sqlite.prepare("SELECT project,operation_id FROM kb_file_operations WHERE state='running'").get() as {
+              project: string;
+              operation_id: string;
+            };
+            const operation = (await f.ledger.operation(row.project, row.operation_id))!;
+            const cancelled = await f.request('key-a', `/v1/kb/files/${operation.file_id}/operations/${row.operation_id}/cancel-prepared`, 'POST');
+            expect(cancelled).toMatchObject({ status: 200, payload: { state: 'cancelled', publication_changed: false, file_deleted: false } });
+          }
+          return await run();
+        }) as typeof bound.run;
+        return bound;
+      }) as typeof statement.bind;
+      return statement;
+    }) as typeof f.db.prepare;
+    const response = await f.request(
+      'key-a',
+      '/v1/kb/ingest/text',
+      'POST',
+      JSON.stringify({ domain: 'manual', text: 'Synthetic prepared cancellation evidence' }),
+    );
+    expect(intercepted).toBe(true);
+    expect(response.status).toBe(409);
+    expect(f.objects.size).toBe(0);
+    const file = f.sqlite.prepare("SELECT id FROM kb_files WHERE project='tenant-a'").get() as { id: string };
+    const deleted = await f.request('key-a', `/v1/kb/files/${file.id}`, 'DELETE');
+    expect(deleted).toMatchObject({ status: 200, payload: { physical_state: 'complete' } });
+    const retry = await f.request(
+      'key-a',
+      '/v1/kb/ingest/text',
+      'POST',
+      JSON.stringify({ domain: 'manual', text: 'Synthetic prepared cancellation evidence' }),
+    );
+    expect(retry.status).toBe(201);
+    expect(f.objects.size).toBeGreaterThan(0);
+  });
+});
+
+it.each([true, false])('serializes both dispatch/cancel orders across independent ledger instances: cancel first %s', async (cancelFirst) => {
+  const { ledger, db } = fixture();
+  const second = new D1FileOwnership(db);
+  await ledger.reserve(input('race'), 'race');
+  const operation = (await ledger.operation('tenant-a', 'race'))!;
+  await ledger.recordIntent(operation, { artifact_id: 'race', kind: 'raw', resource_id: 'owned/race', provider: 'r2' });
+  const cancel = () => ledger.cancelPrepared('tenant-a', 'race');
+  const start = () => second.startWrite(operation, 'race');
+  const [first, other] = await Promise.all(cancelFirst ? [cancel(), start()] : [start(), cancel()]);
+  expect([first, other]).toEqual([true, false]);
+  expect((await ledger.operation('tenant-a', 'race'))?.state).toBe(cancelFirst ? 'settled' : 'running');
+});
+it('retains the published generation when a later prepared reprocess is cancelled', async () => {
+  const { ledger } = fixture();
+  await uploaded(ledger);
+  const before = await ledger.get('tenant-a', 'a');
+  const op = (await ledger.claim('tenant-a', 'a', 'retry', 'reprocess'))!;
+  await ledger.recordIntent(op, { artifact_id: 'retry', kind: 'parse', resource_id: ownedParseKey(op), provider: 'r2' });
+  expect(await ledger.recordWrite('tenant-a', 'retry', 'retry', 'confirmed')).toBe(false);
+  expect(await ledger.cancelPrepared('tenant-a', 'retry')).toBe(true);
+  expect(await ledger.get('tenant-a', 'a')).toMatchObject({ state: 'active', published_generation: before?.published_generation, active_operation_id: null });
+  expect(await ledger.claim('tenant-a', 'a', 'next', 'reprocess')).not.toBeNull();
+});
+
+it('migrates old intent records to unknown instead of falsely recoverable prepared state', async () => {
+  const { ledger, sqlite } = fixture(undefined, (sql) => {
+    sql.exec(
+      "INSERT INTO kb_file_lifecycle(project,file_id,domain,content_hash,storage_version,state,generation,active_operation_id) VALUES ('tenant-a','legacy','manual','hash',2,'uploading',1,'legacy-op'); INSERT INTO kb_file_operations(operation_id,project,file_id,generation,kind,state) VALUES ('legacy-op','tenant-a','legacy',1,'upload','running'); INSERT INTO kb_file_artifacts(artifact_id,project,file_id,generation,operation_id,kind,resource_id,provider) VALUES ('legacy-artifact','tenant-a','legacy',1,'legacy-op','raw','legacy-key','r2');",
+    );
+  });
+  expect(sqlite.prepare("SELECT dispatch_state FROM kb_file_artifacts WHERE artifact_id='legacy-artifact'").get()).toMatchObject({ dispatch_state: 'unknown' });
+  expect(await ledger.cancelPrepared('tenant-a', 'legacy-op')).toBe(false);
+});
+
+it('rejects mismatched owner, file, generation and repeated dispatch', async () => {
+  const { ledger } = fixture();
+  await ledger.reserve(input('scoped'), 'scoped');
+  const operation = (await ledger.operation('tenant-a', 'scoped'))!;
+  await ledger.recordIntent(operation, { artifact_id: 'scoped', kind: 'raw', resource_id: 'owned/scoped', provider: 'r2' });
+  expect(await ledger.startWrite({ ...operation, project: 'tenant-b' }, 'scoped')).toBe(false);
+  expect(await ledger.startWrite({ ...operation, file_id: 'other' }, 'scoped')).toBe(false);
+  expect(await ledger.startWrite({ ...operation, generation: operation.generation + 1 }, 'scoped')).toBe(false);
+  expect(await ledger.startWrite(operation, 'scoped')).toBe(true);
+  expect(await ledger.startWrite(operation, 'scoped')).toBe(false);
+  expect(await ledger.cancelPrepared('tenant-a', 'scoped')).toBe(false);
+});
+
+it('rolls back cancellation completely if recording never-written cleanup fails', async () => {
+  const { ledger, sqlite } = fixture();
+  await ledger.reserve(input('atomic'), 'atomic');
+  const operation = (await ledger.operation('tenant-a', 'atomic'))!;
+  await ledger.recordIntent(operation, { artifact_id: 'atomic', kind: 'raw', resource_id: 'owned/atomic', provider: 'r2' });
+  sqlite.exec("CREATE TRIGGER fail_cancel BEFORE UPDATE OF cleanup_state ON kb_file_artifacts BEGIN SELECT RAISE(ABORT,'synthetic cancellation failure'); END");
+  await expect(ledger.cancelPrepared('tenant-a', 'atomic')).rejects.toThrow('synthetic cancellation failure');
+  expect(await ledger.operation('tenant-a', 'atomic')).toMatchObject({ state: 'running' });
+  expect(await ledger.get('tenant-a', 'atomic')).toMatchObject({ active_operation_id: 'atomic' });
+  expect(sqlite.prepare("SELECT dispatch_state,cleanup_state FROM kb_file_artifacts WHERE artifact_id='atomic'").get()).toMatchObject({
+    dispatch_state: 'prepared',
+    cleanup_state: 'pending',
+  });
+  sqlite.exec('DROP TRIGGER fail_cancel');
+  expect(await ledger.startWrite(operation, 'atomic')).toBe(true);
+  expect(await ledger.cancelPrepared('tenant-a', 'atomic')).toBe(false);
+});
+
+it('authenticates and scopes prepared recovery behind the existing ownership activation gate', async () => {
+  const f = handlerFixture();
+  await f.ledger.reserve(input('route'), 'route-op');
+  const operation = (await f.ledger.operation('tenant-a', 'route-op'))!;
+  await f.ledger.recordIntent(operation, { artifact_id: 'route', kind: 'raw', resource_id: 'owned/route', provider: 'r2' });
+  const route = '/v1/kb/files/route/operations/route-op/cancel-prepared';
+  expect((await f.request('invalid', route, 'POST')).status).toBe(401);
+  expect((await f.request('key-b', route, 'POST')).status).toBe(404);
+  expect((await f.request('key-a', '/v1/kb/files/route/operations/unknown/cancel-prepared', 'POST')).status).toBe(404);
+  expect((await f.request('key-a', '/v1/kb/files/other/operations/route-op/cancel-prepared', 'POST')).status).toBe(404);
+  expect((await f.request('key-a', route, 'POST', undefined, createApp())).status).toBe(404);
+  expect((await f.ledger.operation('tenant-a', 'route-op'))?.state).toBe('running');
+  for (let retry = 0; retry < 2; retry++)
+    expect(await f.request('key-a', route, 'POST')).toMatchObject({
+      status: 200,
+      payload: { state: 'cancelled', publication_changed: false, file_deleted: false },
+    });
+  await f.ledger.reserve(input('started', 'tenant-a', 'other'), 'started-op');
+  const started = (await f.ledger.operation('tenant-a', 'started-op'))!;
+  await f.ledger.recordIntent(started, { artifact_id: 'started', kind: 'raw', resource_id: 'owned/started', provider: 'r2' });
+  expect(await f.ledger.startWrite(started, 'started')).toBe(true);
+  expect((await f.request('key-a', '/v1/kb/files/started/operations/started-op/cancel-prepared', 'POST')).status).toBe(409);
+  expect((await f.ledger.operation('tenant-a', 'started-op'))?.state).toBe('running');
+  expect(f.objects.size).toBe(0);
 });

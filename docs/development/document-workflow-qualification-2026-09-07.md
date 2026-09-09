@@ -259,3 +259,49 @@ confined to the existing animated footer strip; no spacing configuration change
 was needed. The [machine-readable local receipt](dependency-repair-2026-09-09.json)
 records these checks. This does not qualify hosted owner ingestion, migration,
 backfill or activation; issue 48 remains open.
+
+
+### Never-dispatched operation recovery (2026-09-09 source candidate)
+
+The additive source migration `0010_file_dispatch_recovery.sql` distinguishes
+new `prepared` artifact intents from writes whose producer durably recorded
+`started`. Existing rows default to `unknown`; they are never inferred safe from
+age or missing provider output. The migration has only been applied to synthetic
+local SQLite, not production.
+
+All owned raw R2, parse R2, D1 document and Vectorize write entrypoints must win a
+conditional `startWrite` transition on the current owner/file/generation before
+writing. `cancelPrepared` uses one D1 transaction to settle an empty or entirely
+prepared, intent-only operation and mark its never-written artifacts cleaned.
+If cancellation wins, subsequent intent insertion and dispatch fail. If any
+write starts first, cancellation fails. Legacy unknown and accepted/confirmed
+writes are also excluded, even if old. Repeated cancellation is safe and does
+not clear a newer reservation or change a published generation.
+
+The authenticated `POST /v1/kb/files/:file_id/operations/:operation_id/cancel-prepared`
+operator route is available only behind the existing internal `ownedFileProtocol`
+activation gate. It takes tenant identity from the service key, returns 404 for
+foreign/unknown IDs or disabled activation, 409 when dispatch cannot be excluded,
+and an idempotent cancellation receipt otherwise. It never deletes the file or
+changes publication. There is no timer or automatic recovery policy. A cancelled initial upload can be deleted and retried
+as a new file/key; it is not resumed under a reused raw key. The unavoidable gap
+between recording `started` and issuing a write remains conservatively pending.
+Cancellation is not a general uncertain-write recovery or staged-publication
+mechanism. Controlled legacy adoption/reservation, indexed/structured backfill,
+publication, provider convergence and owner-account qualification remain open in
+[issue 48](https://github.com/sass-maker/knowledge-base/issues/48).
+
+
+Synthetic proof covers both dispatch/cancel transaction orderings across independent
+ledger instances sharing one real SQLite connection, empty-set cancellation versus later intent creation, legacy
+migration defaults, tenant/file/generation mismatch and dispatch replay, failed
+cancellation transaction rollback, retained published generations, and the actual
+upload handler refusing a provider write after cancellation then accepting a fresh
+upload after deletion. These are local SQL/handler results, not cross-process/D1 runtime, live recovery
+or cross-provider convergence qualification.
+
+
+Final local source validation: all 424 Worker tests (including 40 ownership tests),
+6 dashboard tests, dashboard/landing builds and every `pnpm quality` gate passed
+on Node 24.20.0. The local migration audit also passed. No remote migration,
+provider write, production activation or deployment was performed.
