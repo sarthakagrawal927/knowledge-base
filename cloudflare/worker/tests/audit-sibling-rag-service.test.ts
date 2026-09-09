@@ -98,6 +98,24 @@ describe('audit-sibling-rag-service', () => {
     ]);
   });
 
+  it('follows linked sources once without recursing through directory cycles', () => {
+    const { fleetRoot, repoRoot } = makeFleet();
+    const app = resolve(fleetRoot, 'consumer');
+    const source = resolve(fleetRoot, 'linked-source');
+    mkdirSync(app);
+    mkdirSync(source);
+    writeFileSync(resolve(source, 'worker.ts'), 'export const service = "rag-service";');
+    symlinkSync(source, resolve(app, 'source'), 'dir');
+    symlinkSync(source, resolve(source, 'self'), 'dir');
+    const report = auditSiblingRagService({
+      fleetRoot, repoRoot, externalRepos: [app],
+      siblingPath: resolve(fleetRoot, 'missing-rag-service'),
+    });
+    expect(report.external_references_ok).toBe(false);
+    expect(report.active_external_references).toHaveLength(1);
+    expect(report.active_external_references[0].file).toBe('source/worker.ts');
+  });
+
   it('reports JS, TOML, YAML, and env-style references to the old rag-service Worker', () => {
     const { fleetRoot, repoRoot } = makeFleet();
     const app = resolve(fleetRoot, 'mixed-consumer');

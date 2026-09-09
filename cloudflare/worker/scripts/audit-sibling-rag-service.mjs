@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -62,12 +62,16 @@ function walkFiles(root) {
   if (!existsSync(root)) return [];
   const files = [];
   const stack = [root];
+  const visited = new Set();
   while (stack.length > 0) {
     const current = stack.pop();
     const name = current.split('/').pop() ?? '';
     if (SKIP_DIRS.has(name)) continue;
     let stat;
     try {
+      const canonical = realpathSync(current);
+      if (visited.has(canonical)) continue;
+      visited.add(canonical);
       stat = statSync(current);
     } catch (error) {
       if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') continue;
