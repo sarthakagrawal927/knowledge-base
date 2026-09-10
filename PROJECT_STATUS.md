@@ -166,3 +166,11 @@ This requires additive source migration 0010, tested only on synthetic SQLite.
 An authenticated tenant-scoped recovery route remains behind the existing
 internal ownership activation gate. No automatic recovery, migration deployment
 or production activation is included. See the [recovery contract](docs/development/document-workflow-qualification-2026-09-07.md#never-dispatched-operation-recovery-2026-09-09-source-candidate).
+
+## 2026-09-10 — settled prepared-artifact cleanup
+
+Cleanup now completes a never-dispatched artifact intent once its producer has
+settled, instead of waiting for a vector that was never written to appear.
+Started and uncertain writes still require provider convergence. The regression
+uses the real SQLite ledger and covers all three dispatch states. This source
+fix retains issue 48's migration, activation and authenticated acceptance gates.

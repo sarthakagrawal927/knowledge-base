@@ -131,6 +131,12 @@ export async function deleteOwnedFile(
   const candidates = await ledger.cleanupCandidates(project, fileId);
   for (const artifact of candidates) {
     try {
+      // Candidates have no running producer. A prepared intent never won
+      // dispatch, and a settled operation cannot start it later.
+      if (artifact.dispatch_state === 'prepared' && artifact.write_state === 'intent') {
+        await ledger.confirmCleanup(project, fileId, artifact.artifact_id);
+        continue;
+      }
       if (artifact.provider === 'r2') {
         if (!env.RAW_DOCS) continue;
         await env.RAW_DOCS.delete(artifact.resource_id);

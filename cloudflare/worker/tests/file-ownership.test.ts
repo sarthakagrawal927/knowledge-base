@@ -13,8 +13,26 @@ import type { QueueCapableApp } from '../src/app-types';
 import type { KbIngestQueueMessage } from '../src/types';
 import type { Env, VectorizeVector } from '../src/types';
 import { D1MetadataRepository } from '../src/kb-metadata-repository';
+import { deleteOwnedFile } from '../src/owned-storage';
 
 const databases: DatabaseSync[] = [];
+it.each(['prepared', 'started', 'unknown'] as const)('settled cleanup distinguishes never-dispatched vectors from %s writes', async (dispatch) => {
+  const { db, ledger, sqlite } = fixture();
+  await uploaded(ledger);
+  const operation = (await ledger.claim('tenant-a', 'a', 'index-a', 'ingest'))!;
+  await ledger.recordIntent(operation, { artifact_id: 'vector-a', kind: 'vector', resource_id: 'vector-a', provider: 'vector:base' });
+  if (dispatch === 'started') expect(await ledger.startWrite(operation, 'vector-a')).toBe(true);
+  if (dispatch === 'unknown') sqlite.exec("UPDATE kb_file_artifacts SET dispatch_state='unknown' WHERE artifact_id='vector-a'");
+  await ledger.settle(operation, false);
+  const getByIds = vi.fn(async () => []);
+  const deleteByIds = vi.fn(async () => ({}));
+  const env = { DB: db, RAW_DOCS: { delete: vi.fn(async () => {}) } } as unknown as Env;
+  const state = await deleteOwnedFile(env, 'tenant-a', 'a', [{ key: 'base', binding: { getByIds, deleteByIds } as never }]);
+  expect(state).toBe(dispatch === 'prepared' ? 'complete' : 'pending');
+  expect(getByIds).toHaveBeenCalledTimes(dispatch === 'prepared' ? 0 : 1);
+  expect(deleteByIds).not.toHaveBeenCalled();
+  expect(await ledger.startWrite(operation, 'vector-a')).toBe(false);
+});
 afterEach(() => vi.unstubAllGlobals());
 afterEach(() => {
   for (const db of databases.splice(0)) db.close();
